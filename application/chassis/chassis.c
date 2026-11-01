@@ -74,6 +74,7 @@ volatile float roll_kp    = 400.0f;     /* N/rad, roll 补偿刚度 */
 volatile float roll_kd    = 20.0f;      /* N/(rad/s), roll 补偿阻尼 */
 
 /* ===== 倒地自起参数（2026-11-01, volatile 支持 ep 在线整定）===== */
+volatile uint8_t rec_enable = 0;   /* 总开关: 0=留存不启用(上电直接站立基线) 1=启用状态机 */
 volatile float rec_l_min      = 0.13f;   /* 收拢位腿长 m（实车:倒地收拢物理下限约 0.124~0.13,硬顶 0.11 会一直顶力）*/
 volatile float rec_l_stand    = 0.30f;   /* 起立目标腿长 m */
 volatile float rec_ramp_speed = 0.0002f; /* 腿长目标变化速率 m/tick = 2cm/s @1kHz */
@@ -358,7 +359,10 @@ void ChassisTask()
     BalanceObserve(&ten_balance_observe);
 
     /* ===== 倒地自起 v2（2026-11-01,南航金城式:姿态纠正+直接站立+变K）=====
-     * 上电只执行一次:
+     * 【当前 rec_enable=0 留存不启用】台架实测: 垫 15cm 可站起, 7cm 时 DONE
+     * 瞬间 LQR 在低腿长大 φ 误差下 Tp 猛甩向后倒——后续按手册第九章
+     * (GRF 力观测器 + 翻倒姿态识别 + 两步恢复)整体重做,本状态机存档。
+     * rec_enable=1 时恢复启用,流程:
      *   FOLD : 摆角 PD 归零 + 腿长 2cm/s 收 rec_l_min, 轮 0, LQR 不跑, 小前馈
      *   DONE : 直接交回正常控制, 腿长目标直接置 rec_l_stand(无中间斜坡段);
      *          防弹车 = 腿长环误差门限幅(rec_push_max) + 轮子在腿伸到
@@ -372,6 +376,15 @@ void ChassisTask()
     static uint8_t rec_reanchor_req = 0; /* 轮使能沿 -> 重锚定 s/yaw 请求 */
     static uint16_t rec_hold = 0;      /* 到位条件连续满足计数(驻留确认) */
     static float l_leg_ramp = 0.30f, r_leg_ramp = 0.30f;
+    if (!rec_enable)
+    {
+        /* 总开关关闭(留存不启用): 上电直接站立基线,
+         * 腿长目标恒 0.3、LQR/轮/roll 补偿全程在线,等价旧硬编码行为。
+         * 注意: ep 在线把 rec_enable 写 1 不会回头跑 FOLD(rec_state 已置 1),
+         * 启用状态机需改回代码重新编译烧录。 */
+        rec_state = 1;
+        rec_wheels_on = 1;
+    }
     if (rec_state == 0)   /* FOLD: 姿态纠正 */
     {
         if (!rec_anchor)
