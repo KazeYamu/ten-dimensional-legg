@@ -48,8 +48,8 @@ static Chassis_Ctrl_Cmd_s chassis_cmd_recv;
  * tanh 平滑过零防 1kHz 抖振。T_c 为 volatile 全局，可在调试器在线调：
  * 左腿 0.5 起调（手测静摩擦大），右腿先 0（过补会变负阻尼、诱发极限环）。
  * 判据：左右腿手掰阻力对称；注意 ω=0 时补偿为 0，静止突破仍靠平衡自振。 */
-volatile float l_joint_fric_t = 1.0f;   /* N·m/关节, 左腿 */
-volatile float r_joint_fric_t = 0.25;   /* N·m/关节, 右腿 */
+volatile float l_joint_fric_t = 0.5f;   /* N·m/关节, 左腿 */
+volatile float r_joint_fric_t = 0.25f;   /* N·m/关节, 右腿 */
 #define FRICTION_TANH_W0  (0.15f)       /* rad/s, tanh 速度平滑尺度 */
 
 /* ===== 轮端库仑摩擦前馈（2026-10-31）=====
@@ -82,6 +82,10 @@ volatile float rec_kd_theta   = 1.23f;
 volatile float rec_tp_max     = 6.0f;    /* 恢复期 Tp 限幅 N·m，防倒地姿态猛甩 */
 volatile float rec_eps_theta  = 0.05f;   /* FOLD 到位阈值: |θ| rad */
 volatile float rec_eps_len    = 0.01f;   /* FOLD/STAND 到位阈值: |L-Ldes| m */
+/* FOLD 专用重力前馈: 倒地时机体不压腿、腿只承自重(几N), 50N 的话
+ * 收拢平衡点被抬高 50/1600≈3.1cm(≈0.14m), 腿长永远进不了 ±1cm 判据。
+ * STAND 起立后腿要承重, 切回 LEG_GRAVITY_FF。 */
+volatile float rec_gravity_ff = 8.0f;    /* N/腿, FOLD 阶段 */
 
 /* 腿长速度估计状态（P-P 级联的阻尼项用） */
 typedef struct
@@ -506,8 +510,11 @@ void ChassisTask()
     float roll_rad = chassis_IMU_data->Roll * 0.01745329252f;
     float dF_roll = rec_active ? 0.0f
                                : ROLL_COMP_DIR * (roll_kp * (-roll_rad) - roll_kd * chassis_IMU_data->Gyro[1]);
-    four_control_datas.l_Tleg = LEG_GRAVITY_FF + l_pid_out - dF_roll;
-    four_control_datas.r_Tleg = LEG_GRAVITY_FF + r_pid_out + dF_roll;
+    /* 重力前馈分阶段: FOLD 用小前馈(腿不承重,见 rec_gravity_ff 注释),
+     * STAND/正常控制用 50N。rec_state 为本函数内静态,作用域可达。 */
+    float grav_ff = (rec_active && rec_state == 0) ? rec_gravity_ff : LEG_GRAVITY_FF;
+    four_control_datas.l_Tleg = grav_ff + l_pid_out - dF_roll;
+    four_control_datas.r_Tleg = grav_ff + r_pid_out + dF_roll;
     chassis_dbg.Fleg_cmd[0] = four_control_datas.l_Tleg;
     chassis_dbg.Fleg_cmd[1] = four_control_datas.r_Tleg;
     chassis_dbg.Ldot[0] = l_dot;
