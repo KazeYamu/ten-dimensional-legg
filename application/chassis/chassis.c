@@ -74,7 +74,7 @@ volatile float roll_kp    = 400.0f;     /* N/rad, roll 补偿刚度 */
 volatile float roll_kd    = 20.0f;      /* N/(rad/s), roll 补偿阻尼 */
 
 /* ===== 倒地自起参数（2026-11-01, volatile 支持 ep 在线整定）===== */
-volatile float rec_l_min      = 0.11f;   /* 收拢位腿长 m（机械行程约 0.11~0.40）*/
+volatile float rec_l_min      = 0.13f;   /* 收拢位腿长 m（实车:倒地收拢物理下限约 0.124~0.13,硬顶 0.11 会一直顶力）*/
 volatile float rec_l_stand    = 0.30f;   /* 起立目标腿长 m */
 volatile float rec_ramp_speed = 0.0002f; /* 腿长目标变化速率 m/tick = 2cm/s @1kHz */
 volatile float rec_kp_theta   = 9.7f;    /* 摆角归零 PD（与 K 矩阵 lθ 行增益同量级）*/
