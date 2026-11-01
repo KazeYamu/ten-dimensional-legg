@@ -49,7 +49,7 @@ static Chassis_Ctrl_Cmd_s chassis_cmd_recv;
  * 左腿 0.5 起调（手测静摩擦大），右腿先 0（过补会变负阻尼、诱发极限环）。
  * 判据：左右腿手掰阻力对称；注意 ω=0 时补偿为 0，静止突破仍靠平衡自振。 */
 volatile float l_joint_fric_t = 1.0f;   /* N·m/关节, 左腿 */
-volatile float r_joint_fric_t = 0.15f;   /* N·m/关节, 右腿 */
+volatile float r_joint_fric_t = 0.25;   /* N·m/关节, 右腿 */
 #define FRICTION_TANH_W0  (0.15f)       /* rad/s, tanh 速度平滑尺度 */
 
 /* ===== 轮端库仑摩擦前馈（2026-10-31）=====
@@ -59,9 +59,19 @@ volatile float r_joint_fric_t = 0.15f;   /* N·m/关节, 右腿 */
  * 加在 Tw 上、限幅之前；左轮 l_wheel_direction=-1 的坐标换算在其后，随之落位。
  * T_c volatile 在线调：右 0.10 / 左 0.05 起调（右轮阻尼大故给多），
  * 过大 = 轮速通道负阻尼 -> 平衡低频抖动，出现即减半。tanh(0)=0 静止无自发力。 */
-volatile float r_wheel_fric_t = 0.10f;  /* N·m/轮, 右轮 */
+volatile float r_wheel_fric_t = 0.15f;  /* N·m/轮, 右轮 */
 volatile float l_wheel_fric_t = 0.05f;  /* N·m/轮, 左轮 */
 #define WHEEL_FRICTION_TANH_V0 (0.03f)  /* m/s, tanh 速度平滑尺度(轮缘线速度) */
+
+/* ===== 腿长刚度 + Roll 补偿（2026-11-01 加强,原为宏 800/100/100/10）=====
+ * 加强依据: 右倾1.3°的静态账 = 腿长下垂差(6.5N/800≈8mm→1.0°) + roll补偿过弱
+ * (KP=100 时 1.3° 仅出力 2.3N)。KP 翻倍 + roll KP 4 倍后残余预计 0.2~0.3°。
+ * volatile 支持 ep 在线整定; 腿抖→Kp 减回 1200 或 Kv 单独加到 250;
+ * 低频晃动→roll_kp 降到 250。 */
+volatile float leg_kp_pos = 1600.0f;    /* N/m, 腿长位置刚度 */
+volatile float leg_kv_vel = 200.0f;     /* N/(m/s), 腿长轴向阻尼 */
+volatile float roll_kp    = 400.0f;     /* N/rad, roll 补偿刚度 */
+volatile float roll_kd    = 20.0f;      /* N/(rad/s), roll 补偿阻尼 */
 
 /* 腿长速度估计状态（P-P 级联的阻尼项用） */
 typedef struct
@@ -270,6 +280,7 @@ void ChassisTask()
     static uint8_t zero_force_last = 0;
     static uint8_t drive_last = 0; /* 行驶模式锁存,零力恢复时置0强制重新锚定 */
     static uint8_t standing_last = 0; /* 站立测试模式锁存,进入沿锚定 yaw */
+    static uint8_t lock_last = 0;     /* 锁定模式锁存,进入沿冻结 s/yaw 目标 */
     uint8_t zero_force = (chassis_cmd_recv.chassis_mode == CHASSIS_ZERO_FORCE);
     if (zero_force != zero_force_last)
     {
@@ -314,15 +325,37 @@ void ChassisTask()
     float l_wheel_angle= -l_wheel_motor->measure.total_angle;
     float l_wheel_w= -l_wheel_motor->measure.speed_aps;
 
-    /* 腿长目标保持站立调试基线;行驶目标在 BalanceObserve 之后生成 */
-    ten_targets.l_leg_length_target = 0.3f;
-    ten_targets.r_leg_length_target = 0.3f;
-
     r_Alpha_beta_calculate(r_theta_f,r_theta_b,r_speed_f,r_speed_b,&r_leg);
     l_Alpha_beta_calculate(l_theta_f,l_theta_b,l_speed_f,l_speed_b,&l_leg);
     r_wheel_control(r_wheel_angle,r_wheel_w,&r_wheel);
     l_wheel_control(l_wheel_angle,l_wheel_w,&l_wheel);
     BalanceObserve(&ten_balance_observe);
+
+    /* ===== 腿长软启动（2026-11-01）=====
+     * 上电首拍锚定当前实测腿长,之后匀速爬向 0.3m:
+     * 避免 KP=1600 时腿弯大误差直接打满 ±150N 限幅把车弹起(130N->200N/腿)。
+     * 零力急停期间本段不执行(上方 return),爬坡自然冻结;爬到位后与
+     * 硬编码 0.3 的行为完全一致。
+     * 【倒地自起扩展点】后续状态机挂这里: 读姿态→摆角归零+腿长收到
+     * 统一位→判据通过后缓慢伸长至站立。 */
+    static uint8_t leg_ramp_init = 0;
+    static float l_leg_ramp = 0.3f, r_leg_ramp = 0.3f;
+    if (!leg_ramp_init)
+    {
+        l_leg_ramp = ten_balance_observe.l_leg_length;
+        r_leg_ramp = ten_balance_observe.r_leg_length;
+        /* 首拍观测异常(如还没跑出有效腿长)时按收拢位起步,防 0 目标 */
+        LIMIT_MIN_MAX(l_leg_ramp, 0.15f, 0.3f);
+        LIMIT_MIN_MAX(r_leg_ramp, 0.15f, 0.3f);
+        leg_ramp_init = 1;
+    }
+    else
+    {
+        if (l_leg_ramp < 0.3f) l_leg_ramp += 0.00015f; /* 0.15 m/s @ 1kHz */
+        if (r_leg_ramp < 0.3f) r_leg_ramp += 0.00015f;
+    }
+    ten_targets.l_leg_length_target = l_leg_ramp;
+    ten_targets.r_leg_length_target = r_leg_ramp;
 
     /* 模型一致 yaw：用里程计+腿角差重构 model_lagrange.py 的 ψ（见文件头部说明）。
      * BalanceObserve 里的 IMU yaw/dyaw 在此被整体替换；IMU 仅保留 φ/roll 用途。 */
@@ -383,7 +416,11 @@ void ChassisTask()
         {
             ten_targets.ds_target = 0.0f;
             ten_targets.dyaw_target = 0.0f;
-            if (!drive_last) /* 锁定进入沿: 冻结当前位姿为目标 */
+            /* 锁定进入沿: 冻结当前位姿为目标。
+             * 注意不能用 !drive_last 判沿——锁定时 drive 恒 0,drive_last 恒 0,
+             * 该条件每拍都真,目标会每拍跟随实测(位置环失效→持续后溜/缓转)。
+             * 必须用独立的 lock_last 锁存,真·一次性进入沿。 */
+            if (!lock_last)
             {
                 ten_targets.s_target   = ten_balance_observe.s;
                 ten_targets.yaw_target = ten_balance_observe.yaw;
@@ -392,6 +429,7 @@ void ChassisTask()
         drive_last = drive;
     } /* end: 非站立测试模式 */
     standing_last = (chassis_cmd_recv.chassis_mode == CHASSIS_STANDING_TEST);
+    lock_last = !drive && !standing_last;
 
     /* yaw_target 卷绕保护：目标始终与实测 ψ 取同一分支，LQR 的 x[2] 限在 ±π 内，
      * 防止 wz 长时间积分与分支卷绕差 2π 时 Tp 猛跳。 */
@@ -407,16 +445,16 @@ void ChassisTask()
     /* 虚拟腿长力 = 重力前馈 + 腿长 PID；VMC 内部再按修正后的 J^T 映射。 */
     float l_dot = LegVelEst(ten_balance_observe.l_leg_length, &l_legvel);
     float r_dot = LegVelEst(ten_balance_observe.r_leg_length, &r_legvel);
-    float l_pid_out = LEG_KP_POS * (ten_targets.l_leg_length_target - ten_balance_observe.l_leg_length)
-                      - LEG_KV_VEL * l_dot;
-    float r_pid_out = LEG_KP_POS * (ten_targets.r_leg_length_target - ten_balance_observe.r_leg_length)
-                      - LEG_KV_VEL * r_dot;
+    float l_pid_out = leg_kp_pos * (ten_targets.l_leg_length_target - ten_balance_observe.l_leg_length)
+                      - leg_kv_vel * l_dot;
+    float r_pid_out = leg_kp_pos * (ten_targets.r_leg_length_target - ten_balance_observe.r_leg_length)
+                      - leg_kv_vel * r_dot;
     LIMIT_MIN_MAX(l_pid_out, -150.0f, 150.0f);   /* 沿用原 PID MaxOut=150 */
     LIMIT_MIN_MAX(r_pid_out, -150.0f, 150.0f);
     /* Roll 补偿（手册 §8.2）：右倾(roll<0)时右腿加力、左腿减力。
      * Roll 单位度 -> rad；Gyro[1] 为 roll 角速度(rad/s)。 */
     float roll_rad = chassis_IMU_data->Roll * 0.01745329252f;
-    float dF_roll = ROLL_COMP_DIR * (ROLL_KP * (-roll_rad) - ROLL_KD * chassis_IMU_data->Gyro[1]);
+    float dF_roll = ROLL_COMP_DIR * (roll_kp * (-roll_rad) - roll_kd * chassis_IMU_data->Gyro[1]);
     four_control_datas.l_Tleg = LEG_GRAVITY_FF + l_pid_out - dF_roll;
     four_control_datas.r_Tleg = LEG_GRAVITY_FF + r_pid_out + dF_roll;
     chassis_dbg.Fleg_cmd[0] = four_control_datas.l_Tleg;

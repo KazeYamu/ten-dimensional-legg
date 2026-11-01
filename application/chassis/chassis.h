@@ -41,21 +41,23 @@ extern volatile float l_wheel_direction;
 #define LEG_GRAVITY_FF    (50.0f)
 
 /* 腿长 P-P 级联（手册 §8.1）：F = FF + Kp*(Ldes-L) - Kv*Ldot
+ * volatile 全局: 支持 ep 在线整定,无需重编译烧录。
  * Kp_pos: 位置刚度 N/m；Kv_vel: 轴向阻尼 N/(m/s)。
- * 垂直支撑 k=2*Kp=1600 N/m、等效质量 ~15 kg -> 固有频率 1.6 Hz，
- * 临界阻尼需每腿 ~155 N/(m/s)，100 对应阻尼比 ~0.65，可调 60~200。 */
-#define LEG_KP_POS        (800.0f)
-#define LEG_KV_VEL        (100.0f)
-/* Ldot 一阶 LPF 系数（1kHz 循环），截止约 25 Hz */
+ * 2026-11-01 加强: 800/100 -> 1600/200,压腿长下垂差(6.5N 扰动 8mm->4mm)。
+ * Ldot 一阶 LPF 系数（1kHz 循环），截止约 25 Hz */
 #define LEG_VEL_LPF       (0.15f)
+extern volatile float leg_kp_pos;   /* N/m, 原 800 */
+extern volatile float leg_kv_vel;   /* N/(m/s), 原 100 */
 
 /* Roll 补偿（手册 §8.2，符号按本机 IMU 实测定）：
  * ΔF = ROLL_KP*(-roll) - ROLL_KD*gyro[1]，右腿 += ΔF，左腿 -= ΔF。
  * 实测 roll=-3.9°(右倾) 时 ΔF>0 -> 右腿加力扶正。
- * 若上车后 roll 发散，把 ROLL_COMP_DIR 翻成 -1.0f。 */
-#define ROLL_KP           (100.0f)   /* N/rad */
-#define ROLL_KD           (10.0f)    /* N/(rad/s) */
+ * 若上车后 roll 发散，把 ROLL_COMP_DIR 翻成 -1.0f。
+ * 2026-11-01 加强: 100/10 -> 400/20,1.3° 时补偿力 2.3N->9N。
+ * volatile 全局: 支持 ep 在线整定。 */
 #define ROLL_COMP_DIR     (1.0f)
+extern volatile float roll_kp;      /* N/rad, 原 100 */
+extern volatile float roll_kd;      /* N/(rad/s), 原 10 */
 
 /* 电机反馈量调试映射:在 Ozone/VarScope 全局符号里搜 chassis_dbg 即可
  * leg_*  : [0]r_front [1]r_behind [2]l_front [3]l_behind

@@ -17,7 +17,7 @@ STATE_NAMES = ['s', 'ds', 'yaw', 'dyaw', 'thl', 'dthl', 'thr', 'dthr', 'phi', 'd
 # ---- 权重（Bryson：Q_ii = 1/σ_i^2，σ = 可接受的最大偏差） ----
 SIGMA_X = dict(s=0.28, ds=0.80, yaw=0.50, dyaw=2.0,
                th=0.30, dth=3.0, phi=0.12, dphi=2.5)
-SIGMA_U = dict(Tw=1.0, Tp=4.0)
+SIGMA_U = dict(Tw=0.8, Tp=4.0)
 
 
 def physical_model(p):
