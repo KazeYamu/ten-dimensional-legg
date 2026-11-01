@@ -73,6 +73,16 @@ volatile float leg_kv_vel = 200.0f;     /* N/(m/s), 腿长轴向阻尼 */
 volatile float roll_kp    = 400.0f;     /* N/rad, roll 补偿刚度 */
 volatile float roll_kd    = 20.0f;      /* N/(rad/s), roll 补偿阻尼 */
 
+/* ===== 倒地自起参数（2026-11-01, volatile 支持 ep 在线整定）===== */
+volatile float rec_l_min      = 0.11f;   /* 收拢位腿长 m（机械行程约 0.11~0.40）*/
+volatile float rec_l_stand    = 0.30f;   /* 起立目标腿长 m */
+volatile float rec_ramp_speed = 0.0002f; /* 腿长目标变化速率 m/tick = 2cm/s @1kHz */
+volatile float rec_kp_theta   = 9.7f;    /* 摆角归零 PD（与 K 矩阵 lθ 行增益同量级）*/
+volatile float rec_kd_theta   = 1.23f;
+volatile float rec_tp_max     = 6.0f;    /* 恢复期 Tp 限幅 N·m，防倒地姿态猛甩 */
+volatile float rec_eps_theta  = 0.05f;   /* FOLD 到位阈值: |θ| rad */
+volatile float rec_eps_len    = 0.01f;   /* FOLD/STAND 到位阈值: |L-Ldes| m */
+
 /* 腿长速度估计状态（P-P 级联的阻尼项用） */
 typedef struct
 {
@@ -331,31 +341,65 @@ void ChassisTask()
     l_wheel_control(l_wheel_angle,l_wheel_w,&l_wheel);
     BalanceObserve(&ten_balance_observe);
 
-    /* ===== 腿长软启动（2026-11-01）=====
-     * 上电首拍锚定当前实测腿长,之后匀速爬向 0.3m:
-     * 避免 KP=1600 时腿弯大误差直接打满 ±150N 限幅把车弹起(130N->200N/腿)。
-     * 零力急停期间本段不执行(上方 return),爬坡自然冻结;爬到位后与
-     * 硬编码 0.3 的行为完全一致。
-     * 【倒地自起扩展点】后续状态机挂这里: 读姿态→摆角归零+腿长收到
-     * 统一位→判据通过后缓慢伸长至站立。 */
-    static uint8_t leg_ramp_init = 0;
-    static float l_leg_ramp = 0.3f, r_leg_ramp = 0.3f;
-    if (!leg_ramp_init)
+    /* ===== 倒地自起（2026-11-01,取代原腿长软启动）=====
+     * 上电只执行一次:
+     *   FOLD  : 摆角目标0(直接Tp力矩PD), 腿长目标从触发实测值匀速收到 rec_l_min
+     *   STAND : 摆角持0, 腿长目标匀速伸到 rec_l_stand
+     *   DONE  : 交回正常控制(目标生成块用锁存沿重新锚定,与原软启动结束态等价)
+     * 恢复期间轮力矩恒 0、LQR 不运行;摆角 PD 符号约定与 LQR 一致
+     * (Tp = Kp*(θt-θ) - Kd*dθ, 即 T = -K(x-xref) 在 θ 行的展开)。
+     * 阶段切换全部用误差阈值判据,无固定延时。 */
+    static uint8_t rec_state = 0;      /* 0=FOLD 1=STAND 2=DONE */
+    static uint8_t rec_anchor = 0;
+    static float l_leg_ramp = 0.30f, r_leg_ramp = 0.30f;
+    uint8_t rec_active = (rec_state != 2);
+    if (rec_state != 2)
     {
-        l_leg_ramp = ten_balance_observe.l_leg_length;
-        r_leg_ramp = ten_balance_observe.r_leg_length;
-        /* 首拍观测异常(如还没跑出有效腿长)时按收拢位起步,防 0 目标 */
-        LIMIT_MIN_MAX(l_leg_ramp, 0.15f, 0.3f);
-        LIMIT_MIN_MAX(r_leg_ramp, 0.15f, 0.3f);
-        leg_ramp_init = 1;
-    }
-    else
-    {
-        if (l_leg_ramp < 0.3f) l_leg_ramp += 0.00015f; /* 0.15 m/s @ 1kHz */
-        if (r_leg_ramp < 0.3f) r_leg_ramp += 0.00015f;
+        if (!rec_anchor)
+        {
+            /* 触发首拍锚定实测腿长;观测异常时夹进机械行程 */
+            l_leg_ramp = ten_balance_observe.l_leg_length;
+            r_leg_ramp = ten_balance_observe.r_leg_length;
+            LIMIT_MIN_MAX(l_leg_ramp, 0.11f, 0.40f);
+            LIMIT_MIN_MAX(r_leg_ramp, 0.11f, 0.40f);
+            rec_anchor = 1;
+        }
+        if (rec_state == 0)   /* FOLD: 收拢 */
+        {
+            if (l_leg_ramp > rec_l_min) l_leg_ramp -= rec_ramp_speed;
+            if (r_leg_ramp > rec_l_min) r_leg_ramp -= rec_ramp_speed;
+            /* 双腿 ramp 到底 + 实测贴近收拢位 + 摆角归零,三者同时满足才切换 */
+            if (l_leg_ramp <= rec_l_min + 1e-4f && r_leg_ramp <= rec_l_min + 1e-4f &&
+                fabsf(ten_balance_observe.l_leg_length - rec_l_min) < rec_eps_len &&
+                fabsf(ten_balance_observe.r_leg_length - rec_l_min) < rec_eps_len &&
+                fabsf(ten_balance_observe.l_theta) < rec_eps_theta &&
+                fabsf(ten_balance_observe.r_theta) < rec_eps_theta)
+                rec_state = 1;
+        }
+        else                  /* STAND: 起立 */
+        {
+            if (l_leg_ramp < rec_l_stand) l_leg_ramp += rec_ramp_speed;
+            if (r_leg_ramp < rec_l_stand) r_leg_ramp += rec_ramp_speed;
+            if (l_leg_ramp >= rec_l_stand - 1e-4f && r_leg_ramp >= rec_l_stand - 1e-4f &&
+                fabsf(ten_balance_observe.l_leg_length - rec_l_stand) < rec_eps_len &&
+                fabsf(ten_balance_observe.r_leg_length - rec_l_stand) < rec_eps_len)
+                rec_state = 2;
+        }
+        /* 摆角归零 PD,符号约定与 LQR 一致 */
+        float l_tp_rec = rec_kp_theta * (0.0f - ten_balance_observe.l_theta)
+                         - rec_kd_theta * ten_balance_observe.l_dtheta;
+        float r_tp_rec = rec_kp_theta * (0.0f - ten_balance_observe.r_theta)
+                         - rec_kd_theta * ten_balance_observe.r_dtheta;
+        LIMIT_MIN_MAX(l_tp_rec, -rec_tp_max, rec_tp_max);
+        LIMIT_MIN_MAX(r_tp_rec, -rec_tp_max, rec_tp_max);
+        four_control_datas.l_Tp = l_tp_rec;
+        four_control_datas.r_Tp = r_tp_rec;
+        four_control_datas.l_Tw = 0.0f;
+        four_control_datas.r_Tw = 0.0f;
     }
     ten_targets.l_leg_length_target = l_leg_ramp;
     ten_targets.r_leg_length_target = r_leg_ramp;
+    chassis_dbg.rec_state = (float)rec_state;
 
     /* 模型一致 yaw：用里程计+腿角差重构 model_lagrange.py 的 ψ（见文件头部说明）。
      * BalanceObserve 里的 IMU yaw/dyaw 在此被整体替换；IMU 仅保留 φ/roll 用途。 */
@@ -369,7 +413,11 @@ void ChassisTask()
      * 行驶(CHASSIS_WHEELLEG_DRIVE): vx>阈值→控速(s_target跟随s), 松杆→定点(s_target冻结);
      *                               wz 积分为 yaw_target,松杆冻结→航向锁定。
      * 锁定(CHASSIS_NO_FOLLOW等): 进入瞬间冻结当前 s/yaw 为目标 → 原地定住。
-     * 上电首拍锁定即冻结,此时 s≈0,yaw≈0,与站立调试的硬编码基线等价。 */
+     * 上电首拍锁定即冻结,此时 s≈0,yaw≈0,与站立调试的硬编码基线等价。
+     * 倒地自起期间整段跳过(LQR 不可信),完成后 lock/drive/standing 锁存
+     * 均保持 0,首个正常拍会走进入沿重新锚定目标。 */
+    if (!rec_active)
+    {
     /* drive 在函数级作用域: 目标生成分支共用 */
     uint8_t drive = (chassis_cmd_recv.chassis_mode == CHASSIS_WHEELLEG_DRIVE);
     if (chassis_cmd_recv.chassis_mode == CHASSIS_STANDING_TEST)
@@ -442,6 +490,7 @@ void ChassisTask()
     chassis_dbg.lqr_u[1] = four_control_datas.r_Tw;
     chassis_dbg.lqr_u[2] = four_control_datas.l_Tp;
     chassis_dbg.lqr_u[3] = four_control_datas.r_Tp;
+    } /* end: !rec_active (倒地自起期间跳过目标生成+LQR) */
     /* 虚拟腿长力 = 重力前馈 + 腿长 PID；VMC 内部再按修正后的 J^T 映射。 */
     float l_dot = LegVelEst(ten_balance_observe.l_leg_length, &l_legvel);
     float r_dot = LegVelEst(ten_balance_observe.r_leg_length, &r_legvel);
@@ -452,9 +501,11 @@ void ChassisTask()
     LIMIT_MIN_MAX(l_pid_out, -150.0f, 150.0f);   /* 沿用原 PID MaxOut=150 */
     LIMIT_MIN_MAX(r_pid_out, -150.0f, 150.0f);
     /* Roll 补偿（手册 §8.2）：右倾(roll<0)时右腿加力、左腿减力。
-     * Roll 单位度 -> rad；Gyro[1] 为 roll 角速度(rad/s)。 */
+     * Roll 单位度 -> rad；Gyro[1] 为 roll 角速度(rad/s)。
+     * 倒地自起期间 roll 无意义且数值大,补偿关闭,防双腿受力不对称。 */
     float roll_rad = chassis_IMU_data->Roll * 0.01745329252f;
-    float dF_roll = ROLL_COMP_DIR * (roll_kp * (-roll_rad) - roll_kd * chassis_IMU_data->Gyro[1]);
+    float dF_roll = rec_active ? 0.0f
+                               : ROLL_COMP_DIR * (roll_kp * (-roll_rad) - roll_kd * chassis_IMU_data->Gyro[1]);
     four_control_datas.l_Tleg = LEG_GRAVITY_FF + l_pid_out - dF_roll;
     four_control_datas.r_Tleg = LEG_GRAVITY_FF + r_pid_out + dF_roll;
     chassis_dbg.Fleg_cmd[0] = four_control_datas.l_Tleg;
@@ -513,19 +564,27 @@ void ChassisTask()
     /* 轮力矩下发：先按 3508 的真实上限钳位，再换算成电流码。
      * 限幅必须放在换算之前 —— 见 chassis.h 里 WHEEL_T_MAX 的注释。 */
     /* 轮端摩擦前馈：r_dx/l_dx 已是前进为正的轮缘线速度(m/s)，直接取符号；
-     * 左轮 l_wheel_direction=-1 的换算在 DMMotorSetRef 处，FF 加在换算前随之落位。 */
-    float ff_rw = r_wheel_fric_t * tanhf(r_wheel.r_dx / WHEEL_FRICTION_TANH_V0);
-    float ff_lw = l_wheel_fric_t * tanhf(l_wheel.l_dx / WHEEL_FRICTION_TANH_V0);
-
-    float r_Tw = four_control_datas.r_Tw + ff_rw;
-    float l_Tw = four_control_datas.l_Tw + ff_lw;
-    LIMIT_MIN_MAX(r_Tw, -WHEEL_T_MAX, WHEEL_T_MAX);
-    LIMIT_MIN_MAX(l_Tw, -WHEEL_T_MAX, WHEEL_T_MAX);
-
+     * 左轮 l_wheel_direction=-1 的换算在 DMMotorSetRef 处，FF 加在换算前随之落位。
+     * 倒地自起期间轮力矩恒 0（含摩擦前馈），保证"恢复全程轮子不出力"。 */
+    float r_Tw, l_Tw;
+    if (rec_active)
+    {
+        r_Tw = 0.0f;
+        l_Tw = 0.0f;
+    }
+    else
+    {
+        float ff_rw = r_wheel_fric_t * tanhf(r_wheel.r_dx / WHEEL_FRICTION_TANH_V0);
+        float ff_lw = l_wheel_fric_t * tanhf(l_wheel.l_dx / WHEEL_FRICTION_TANH_V0);
+        r_Tw = four_control_datas.r_Tw + ff_rw;
+        l_Tw = four_control_datas.l_Tw + ff_lw;
+        LIMIT_MIN_MAX(r_Tw, -WHEEL_T_MAX, WHEEL_T_MAX);
+        LIMIT_MIN_MAX(l_Tw, -WHEEL_T_MAX, WHEEL_T_MAX);
+        chassis_dbg.wheel_ff[0] = ff_lw;
+        chassis_dbg.wheel_ff[1] = ff_rw;
+    }
     chassis_dbg.Tw_cmd[0] = l_Tw;
     chassis_dbg.Tw_cmd[1] = r_Tw;
-    chassis_dbg.wheel_ff[0] = ff_lw;
-    chassis_dbg.wheel_ff[1] = ff_rw;
 
     DJIMotorSetRef(r_wheel_motor, WHEEL_T_PER_RAW * r_Tw);
     DJIMotorSetRef(l_wheel_motor, l_wheel_direction * WHEEL_T_PER_RAW * l_Tw);
