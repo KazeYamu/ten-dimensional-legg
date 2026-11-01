@@ -80,8 +80,11 @@ volatile float rec_ramp_speed = 0.0002f; /* 腿长目标变化速率 m/tick = 2c
 volatile float rec_kp_theta   = 9.7f;    /* 摆角归零 PD（与 K 矩阵 lθ 行增益同量级）*/
 volatile float rec_kd_theta   = 1.23f;
 volatile float rec_tp_max     = 6.0f;    /* 恢复期 Tp 限幅 N·m，防倒地姿态猛甩 */
-volatile float rec_eps_theta  = 0.05f;   /* FOLD 到位阈值: |θ| rad */
-volatile float rec_eps_len    = 0.01f;   /* FOLD/STAND 到位阈值: |L-Ldes| m */
+volatile float rec_eps_theta  = 0.25f;   /* FOLD 到位阈值: |θ| rad,倒地时摆角被地面撑住,0.05 到不了 */
+volatile float rec_eps_len    = 0.03f;   /* FOLD/STAND 到位阈值: |L-Ldes| m,收拢位受机械干涉 ~2cm */
+/* 到位确认需要条件连续保持的时间: 2026-11-01 实车发现倒地姿态下腿长/摆角
+ * 被地面和机体撑住,严格阈值永远不满足 -> 改"目标附近 + 驻留确认" */
+volatile uint16_t rec_hold_ticks = 500;  /* 0.5s @1kHz */
 /* FOLD 专用重力前馈: 倒地时机体不压腿、腿只承自重(几N), 50N 的话
  * 收拢平衡点被抬高 50/1600≈3.1cm(≈0.14m), 腿长永远进不了 ±1cm 判据。
  * STAND 起立后腿要承重, 切回 LEG_GRAVITY_FF。 */
@@ -355,6 +358,7 @@ void ChassisTask()
      * 阶段切换全部用误差阈值判据,无固定延时。 */
     static uint8_t rec_state = 0;      /* 0=FOLD 1=STAND 2=DONE */
     static uint8_t rec_anchor = 0;
+    static uint16_t rec_hold = 0;      /* 到位条件连续满足计数(驻留确认) */
     static float l_leg_ramp = 0.30f, r_leg_ramp = 0.30f;
     uint8_t rec_active = (rec_state != 2);
     if (rec_state != 2)
@@ -372,22 +376,35 @@ void ChassisTask()
         {
             if (l_leg_ramp > rec_l_min) l_leg_ramp -= rec_ramp_speed;
             if (r_leg_ramp > rec_l_min) r_leg_ramp -= rec_ramp_speed;
-            /* 双腿 ramp 到底 + 实测贴近收拢位 + 摆角归零,三者同时满足才切换 */
-            if (l_leg_ramp <= rec_l_min + 1e-4f && r_leg_ramp <= rec_l_min + 1e-4f &&
-                fabsf(ten_balance_observe.l_leg_length - rec_l_min) < rec_eps_len &&
-                fabsf(ten_balance_observe.r_leg_length - rec_l_min) < rec_eps_len &&
-                fabsf(ten_balance_observe.l_theta) < rec_eps_theta &&
-                fabsf(ten_balance_observe.r_theta) < rec_eps_theta)
+            /* 到位 = ramp 到底 + 实测进允许误差带 + 摆角接近 0,
+             * 双腿条件连续保持 rec_hold_ticks 后才切换(驻留确认,防瞬间满足) */
+            uint8_t l_ok = (l_leg_ramp <= rec_l_min + 1e-4f) &&
+                           (fabsf(ten_balance_observe.l_leg_length - rec_l_min) < rec_eps_len) &&
+                           (fabsf(ten_balance_observe.l_theta) < rec_eps_theta);
+            uint8_t r_ok = (r_leg_ramp <= rec_l_min + 1e-4f) &&
+                           (fabsf(ten_balance_observe.r_leg_length - rec_l_min) < rec_eps_len) &&
+                           (fabsf(ten_balance_observe.r_theta) < rec_eps_theta);
+            rec_hold = (l_ok && r_ok) ? (uint16_t)(rec_hold + 1) : 0;
+            if (rec_hold >= rec_hold_ticks)
+            {
                 rec_state = 1;
+                rec_hold = 0;
+            }
         }
         else                  /* STAND: 起立 */
         {
             if (l_leg_ramp < rec_l_stand) l_leg_ramp += rec_ramp_speed;
             if (r_leg_ramp < rec_l_stand) r_leg_ramp += rec_ramp_speed;
-            if (l_leg_ramp >= rec_l_stand - 1e-4f && r_leg_ramp >= rec_l_stand - 1e-4f &&
-                fabsf(ten_balance_observe.l_leg_length - rec_l_stand) < rec_eps_len &&
-                fabsf(ten_balance_observe.r_leg_length - rec_l_stand) < rec_eps_len)
+            uint8_t l_ok = (l_leg_ramp >= rec_l_stand - 1e-4f) &&
+                           (fabsf(ten_balance_observe.l_leg_length - rec_l_stand) < rec_eps_len);
+            uint8_t r_ok = (r_leg_ramp >= rec_l_stand - 1e-4f) &&
+                           (fabsf(ten_balance_observe.r_leg_length - rec_l_stand) < rec_eps_len);
+            rec_hold = (l_ok && r_ok) ? (uint16_t)(rec_hold + 1) : 0;
+            if (rec_hold >= rec_hold_ticks)
+            {
                 rec_state = 2;
+                rec_hold = 0;
+            }
         }
         /* 摆角归零 PD,符号约定与 LQR 一致 */
         float l_tp_rec = rec_kp_theta * (0.0f - ten_balance_observe.l_theta)
