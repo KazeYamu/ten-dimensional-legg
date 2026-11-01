@@ -90,7 +90,7 @@ typedef struct
     float Tw_cmd[2];
     float Roll;           /* IMU roll，度，调试 roll 补偿用 */
     float dFroll;         /* roll 补偿力差 ΔF（N），右腿为正 */
-    float rec_state;      /* 倒地自起状态机: 0=FOLD 1=EXTEND 2=BALANCE 3=DONE */
+    float rec_state;      /* 倒地自起状态机: 0=FOLD 1=DONE */
 } Chassis_Dbg_s;
 extern volatile Chassis_Dbg_s chassis_dbg;
 
