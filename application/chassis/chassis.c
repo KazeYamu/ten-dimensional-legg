@@ -360,7 +360,6 @@ void ChassisTask()
     static uint8_t rec_anchor = 0;
     static uint16_t rec_hold = 0;      /* 到位条件连续满足计数(驻留确认) */
     static float l_leg_ramp = 0.30f, r_leg_ramp = 0.30f;
-    uint8_t rec_active = (rec_state != 2);
     if (rec_state != 2)
     {
         if (!rec_anchor)
@@ -390,8 +389,20 @@ void ChassisTask()
                 rec_state = 1;
                 rec_hold = 0;
             }
+            /* FOLD 专属: 摆角归零 PD(符号约定与 LQR 一致) + 轮力矩 0。
+             * 仅倒地收拢阶段独占;STAND 起立阶段 LQR/轮控全恢复,见下方各门控。 */
+            float l_tp_rec = rec_kp_theta * (0.0f - ten_balance_observe.l_theta)
+                             - rec_kd_theta * ten_balance_observe.l_dtheta;
+            float r_tp_rec = rec_kp_theta * (0.0f - ten_balance_observe.r_theta)
+                             - rec_kd_theta * ten_balance_observe.r_dtheta;
+            LIMIT_MIN_MAX(l_tp_rec, -rec_tp_max, rec_tp_max);
+            LIMIT_MIN_MAX(r_tp_rec, -rec_tp_max, rec_tp_max);
+            four_control_datas.l_Tp = l_tp_rec;
+            four_control_datas.r_Tp = r_tp_rec;
+            four_control_datas.l_Tw = 0.0f;
+            four_control_datas.r_Tw = 0.0f;
         }
-        else                  /* STAND: 起立 */
+        else                  /* STAND: 起立(轮控/LQR 已恢复,只接管腿长目标) */
         {
             if (l_leg_ramp < rec_l_stand) l_leg_ramp += rec_ramp_speed;
             if (r_leg_ramp < rec_l_stand) r_leg_ramp += rec_ramp_speed;
@@ -406,17 +417,6 @@ void ChassisTask()
                 rec_hold = 0;
             }
         }
-        /* 摆角归零 PD,符号约定与 LQR 一致 */
-        float l_tp_rec = rec_kp_theta * (0.0f - ten_balance_observe.l_theta)
-                         - rec_kd_theta * ten_balance_observe.l_dtheta;
-        float r_tp_rec = rec_kp_theta * (0.0f - ten_balance_observe.r_theta)
-                         - rec_kd_theta * ten_balance_observe.r_dtheta;
-        LIMIT_MIN_MAX(l_tp_rec, -rec_tp_max, rec_tp_max);
-        LIMIT_MIN_MAX(r_tp_rec, -rec_tp_max, rec_tp_max);
-        four_control_datas.l_Tp = l_tp_rec;
-        four_control_datas.r_Tp = r_tp_rec;
-        four_control_datas.l_Tw = 0.0f;
-        four_control_datas.r_Tw = 0.0f;
     }
     ten_targets.l_leg_length_target = l_leg_ramp;
     ten_targets.r_leg_length_target = r_leg_ramp;
@@ -435,9 +435,10 @@ void ChassisTask()
      *                               wz 积分为 yaw_target,松杆冻结→航向锁定。
      * 锁定(CHASSIS_NO_FOLLOW等): 进入瞬间冻结当前 s/yaw 为目标 → 原地定住。
      * 上电首拍锁定即冻结,此时 s≈0,yaw≈0,与站立调试的硬编码基线等价。
-     * 倒地自起期间整段跳过(LQR 不可信),完成后 lock/drive/standing 锁存
-     * 均保持 0,首个正常拍会走进入沿重新锚定目标。 */
-    if (!rec_active)
+     * 倒地自起 FOLD 阶段整段跳过(LQR 不可信);STAND 起立阶段恢复运行,
+     * 此时 lock/drive/standing 锁存均为 0,首拍走进入沿锚定目标。
+     * 腿长目标仍由恢复斜坡接管(下方赋值),直到 DONE。 */
+    if (rec_state != 0)
     {
     /* drive 在函数级作用域: 目标生成分支共用 */
     uint8_t drive = (chassis_cmd_recv.chassis_mode == CHASSIS_WHEELLEG_DRIVE);
@@ -511,7 +512,7 @@ void ChassisTask()
     chassis_dbg.lqr_u[1] = four_control_datas.r_Tw;
     chassis_dbg.lqr_u[2] = four_control_datas.l_Tp;
     chassis_dbg.lqr_u[3] = four_control_datas.r_Tp;
-    } /* end: !rec_active (倒地自起期间跳过目标生成+LQR) */
+    } /* end: rec_state!=0 (仅 FOLD 跳过目标生成+LQR;STAND 起立已恢复) */
     /* 虚拟腿长力 = 重力前馈 + 腿长 PID；VMC 内部再按修正后的 J^T 映射。 */
     float l_dot = LegVelEst(ten_balance_observe.l_leg_length, &l_legvel);
     float r_dot = LegVelEst(ten_balance_observe.r_leg_length, &r_legvel);
@@ -523,13 +524,13 @@ void ChassisTask()
     LIMIT_MIN_MAX(r_pid_out, -150.0f, 150.0f);
     /* Roll 补偿（手册 §8.2）：右倾(roll<0)时右腿加力、左腿减力。
      * Roll 单位度 -> rad；Gyro[1] 为 roll 角速度(rad/s)。
-     * 倒地自起期间 roll 无意义且数值大,补偿关闭,防双腿受力不对称。 */
+     * FOLD 倒地阶段 roll 无意义且数值大,补偿关闭;STAND 起立阶段恢复。 */
     float roll_rad = chassis_IMU_data->Roll * 0.01745329252f;
-    float dF_roll = rec_active ? 0.0f
+    float dF_roll = (rec_state == 0) ? 0.0f
                                : ROLL_COMP_DIR * (roll_kp * (-roll_rad) - roll_kd * chassis_IMU_data->Gyro[1]);
     /* 重力前馈分阶段: FOLD 用小前馈(腿不承重,见 rec_gravity_ff 注释),
-     * STAND/正常控制用 50N。rec_state 为本函数内静态,作用域可达。 */
-    float grav_ff = (rec_active && rec_state == 0) ? rec_gravity_ff : LEG_GRAVITY_FF;
+     * STAND 起立要承重 + 正常控制用 50N。 */
+    float grav_ff = (rec_state == 0) ? rec_gravity_ff : LEG_GRAVITY_FF;
     four_control_datas.l_Tleg = grav_ff + l_pid_out - dF_roll;
     four_control_datas.r_Tleg = grav_ff + r_pid_out + dF_roll;
     chassis_dbg.Fleg_cmd[0] = four_control_datas.l_Tleg;
@@ -589,9 +590,9 @@ void ChassisTask()
      * 限幅必须放在换算之前 —— 见 chassis.h 里 WHEEL_T_MAX 的注释。 */
     /* 轮端摩擦前馈：r_dx/l_dx 已是前进为正的轮缘线速度(m/s)，直接取符号；
      * 左轮 l_wheel_direction=-1 的换算在 DMMotorSetRef 处，FF 加在换算前随之落位。
-     * 倒地自起期间轮力矩恒 0（含摩擦前馈），保证"恢复全程轮子不出力"。 */
+     * 仅 FOLD 倒地阶段轮力矩恒 0;STAND 起立阶段轮控随 LQR 恢复。 */
     float r_Tw, l_Tw;
-    if (rec_active)
+    if (rec_state == 0)
     {
         r_Tw = 0.0f;
         l_Tw = 0.0f;
