@@ -14,6 +14,37 @@ volatile float grf_m_w      = 0.5f;   /* 单侧轮+轮轴组件 kg,参数表 m_u
 volatile float grf_accel_fc = 25.0f;  /* z̈ 低通截止 Hz,悬空判定要快,压噪靠腿力通道 */
 volatile float grf_fleg_fc  = 60.0f;  /* 腿力低通截止 Hz,力矩噪声 ~0.5N,可放宽 */
 
+/* T2 悬空门控参数：站立 F_n≈55~65N,离地沿 0.1s 内掉到 40 以下(2026-11-02 实测),
+ * 门限 20/35 迟留裕量充足;颠簸误触发靠双侧同时低+驻留时间兜底。 */
+volatile float grf_air_th_off = 20.0f;
+volatile float grf_air_th_on  = 35.0f;
+volatile uint16_t grf_air_hold_off = 50;  /* 50ms */
+volatile uint16_t grf_air_hold_on  = 20;  /* 20ms */
+static uint8_t grf_air = 0;
+static uint16_t grf_air_cnt = 0;
+
+uint8_t GRF_Airborne(void) { return grf_air; }
+
+static void grf_air_update(float n_l, float n_r)
+{
+    if (!grf_air)
+    {
+        if (n_l < grf_air_th_off && n_r < grf_air_th_off)
+        {
+            if (++grf_air_cnt >= grf_air_hold_off) { grf_air = 1; grf_air_cnt = 0; }
+        }
+        else grf_air_cnt = 0;
+    }
+    else
+    {
+        if (n_l > grf_air_th_on && n_r > grf_air_th_on)
+        {
+            if (++grf_air_cnt >= grf_air_hold_on) { grf_air = 0; grf_air_cnt = 0; }
+        }
+        else grf_air_cnt = 0;
+    }
+}
+
 typedef struct { float y; uint8_t started; } GRF_Lpf_s;
 static GRF_Lpf_s lpf_fleg_l, lpf_fleg_r, lpf_zdd, lpf_fn_l, lpf_fn_r;
 
@@ -38,6 +69,8 @@ void GRF_Init(void)
 {
     grf_dbg = (GRF_Dbg_s){0};
     lpf_fleg_l = lpf_fleg_r = lpf_zdd = lpf_fn_l = lpf_fn_r = (GRF_Lpf_s){0, 0};
+    grf_air = 0;
+    grf_air_cnt = 0;
 }
 
 void GRF_Update(float r_Tf, float r_Tb, float l_Tf, float l_Tb, float dt)
@@ -81,4 +114,6 @@ void GRF_Update(float r_Tf, float r_Tb, float l_Tf, float l_Tb, float dt)
     grf_dbg.zdd_w     = grf_lpf_step(&lpf_zdd, zdd, grf_accel_fc, dt);
     grf_dbg.F_n_l     = grf_lpf_step(&lpf_fn_l, N_l, grf_fleg_fc, dt);
     grf_dbg.F_n_r     = grf_lpf_step(&lpf_fn_r, N_r, grf_fleg_fc, dt);
+    grf_air_update(grf_dbg.F_n_l, grf_dbg.F_n_r);
+    grf_dbg.air_state = grf_air;
 }

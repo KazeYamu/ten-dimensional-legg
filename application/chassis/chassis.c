@@ -101,6 +101,12 @@ volatile float rec_wheel_margin = 0.03f;   /* 轮使能门限 = 站立腿长 - �
  * STAND 起立后腿要承重, 切回 LEG_GRAVITY_FF。 */
 volatile float rec_gravity_ff = 8.0f;    /* N/腿, FOLD 阶段 */
 
+/* ===== T2 GRF 悬空门控（2026-11-02）=====
+ * 悬空期 Tp 弃 LQR, 换摆角纯阻尼(腿自然下垂归位); 轮力矩在输出端清零。
+ * kd 过大->悬空时腿抖; 过小->腿摆收不住, 落地姿态差。 */
+volatile float air_swing_kd = 2.0f;      /* N·m/(rad/s), 摆角阻尼 */
+volatile float air_tp_max   = 6.0f;      /* N·m, 悬空期 Tp 限幅 */
+
 /* 腿长速度估计状态（P-P 级联的阻尼项用） */
 typedef struct
 {
@@ -470,6 +476,7 @@ void ChassisTask()
      * 上电首拍锁定即冻结,此时 s≈0,yaw≈0,与站立调试的硬编码基线等价。
      * 倒地自起 FOLD 阶段整段跳过;DONE 恢复运行,此时 lock/drive/standing
      * 锁存均为 0,首拍走进入沿锚定。腿长目标由恢复流程恒置站立位。 */
+    uint8_t air_state = GRF_Airborne(); /* T2 悬空快照,FOLD 期间也有效(轮输出端共用) */
     if (rec_state != 0)
     {
     /* drive 在函数级作用域: 目标生成分支共用 */
@@ -544,6 +551,32 @@ void ChassisTask()
     chassis_dbg.lqr_u[1] = four_control_datas.r_Tw;
     chassis_dbg.lqr_u[2] = four_control_datas.l_Tp;
     chassis_dbg.lqr_u[3] = four_control_datas.r_Tp;
+
+    /* ===== T2: GRF 悬空门控（2026-11-02 实测驱动）=====
+     * 悬空时 LQR 即正反馈(实测: 轮疯转+摆角甩到轮心过髋), 处置:
+     * Tw/Tp 弃 LQR, Tp 换摆角纯阻尼(腿自然下垂), 腿长伺服保持站立位;
+     * 轮力矩在下方输出端清零(止疯转, 也消 Tw 反作用对力矩反推的污染)。
+     * 腿摆住后 F_leg 卸到 -m_w·g, F_n 干净归 0;
+     * 落地沿(F_n 双侧>th_on 驻留)恢复 LQR 并重锚定 s/yaw 清空转里程漂移。 */
+    static uint8_t air_reanchor = 0;
+    if (air_state)
+    {
+        float tp_l = -air_swing_kd * ten_balance_observe.l_dtheta;
+        float tp_r = -air_swing_kd * ten_balance_observe.r_dtheta;
+        LIMIT_MIN_MAX(tp_l, -air_tp_max, air_tp_max);
+        LIMIT_MIN_MAX(tp_r, -air_tp_max, air_tp_max);
+        four_control_datas.l_Tw = 0.0f;
+        four_control_datas.r_Tw = 0.0f;
+        four_control_datas.l_Tp = tp_l;
+        four_control_datas.r_Tp = tp_r;
+        air_reanchor = 1;
+    }
+    else if (air_reanchor)
+    {   /* 落地沿: 悬空期间轮子自由空转的里程漂移一次性清掉 */
+        ten_targets.s_target   = ten_balance_observe.s;
+        ten_targets.yaw_target = ten_balance_observe.yaw;
+        air_reanchor = 0;
+    }
     } /* end: rec_state!=0 (仅 FOLD 跳过目标生成+LQR;DONE 已恢复) */
     /* 虚拟腿长力 = 重力前馈 + 腿长 PID；VMC 内部再按修正后的 J^T 映射。 */
     float l_dot = LegVelEst(ten_balance_observe.l_leg_length, &l_legvel);
@@ -631,9 +664,10 @@ void ChassisTask()
      * 左轮 l_wheel_direction=-1 的换算在 DMMotorSetRef 处，FF 加在换算前随之落位。
      * 仅 FOLD/EXTEND(轮未触地)阶段轮力矩恒 0;BALANCE 起轮控随 LQR 恢复。 */
     float r_Tw, l_Tw;
-    if (rec_state == 0 || !rec_wheels_on)
+    if (rec_state == 0 || !rec_wheels_on || air_state)
     {
-        /* FOLD 阶段, 或 DONE 后腿还没伸到轮使能门限(此时轮必然悬空) */
+        /* FOLD 阶段, 或 DONE 后腿还没伸到轮使能门限(此时轮必然悬空),
+         * 或 GRF 判悬空(T2): 轮力矩清零, 摩擦前馈一并跳过 */
         r_Tw = 0.0f;
         l_Tw = 0.0f;
     }

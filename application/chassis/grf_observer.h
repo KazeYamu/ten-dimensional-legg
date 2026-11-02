@@ -1,6 +1,8 @@
 #ifndef _GRF_OBSERVER_H
 #define _GRF_OBSERVER_H
 
+#include <stdint.h>
+
 /* ===== GRF 地面反作用力观测器（手册第九章 T1, 2026-11-02）=====
  * 轮端自由体（本工程符号约定: F>0=伸腿, 腿把轮向下压）:
  *   N = m_w*(z̈_w + g) + F_leg,z
@@ -24,6 +26,7 @@ typedef struct
     float F_n_r;       /* 右轮地面反作用力 */
     float F_n_l_raw;   /* 未滤波原值（看噪声/调 LPF 用） */
     float F_n_r_raw;
+    uint8_t air_state; /* T2 悬空状态机: 0=触地 1=悬空 */
 } GRF_Dbg_s;
 
 extern volatile GRF_Dbg_s grf_dbg;
@@ -31,6 +34,13 @@ extern volatile GRF_Dbg_s grf_dbg;
 extern volatile float grf_m_w;        /* 单侧轮+轮轴组件质量 kg（参数表 m_u） */
 extern volatile float grf_accel_fc;   /* z̈ LPF 截止频率 Hz */
 extern volatile float grf_fleg_fc;    /* 腿力 LPF 截止频率 Hz */
+
+/* ===== T2 悬空门控（迟滞+驻留,防颠簸误触发）===== */
+extern volatile float grf_air_th_off;      /* 离地门限 N：双侧 F_n 低于此 */
+extern volatile float grf_air_th_on;       /* 落地门限 N：双侧 F_n 高于此（迟滞） */
+extern volatile uint16_t grf_air_hold_off; /* 离地判定驻留 tick @1kHz */
+extern volatile uint16_t grf_air_hold_on;  /* 落地判定驻留 tick @1kHz */
+uint8_t GRF_Airborne(void);                /* 1=悬空 0=触地（本拍状态机输出） */
 
 void GRF_Init(void);
 /* @param r_Tf/r_Tb 右腿前后关节反馈力矩（电机坐标, N·m）
