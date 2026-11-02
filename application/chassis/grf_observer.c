@@ -14,12 +14,17 @@ volatile float grf_m_w      = 0.5f;   /* 单侧轮+轮轴组件 kg,参数表 m_u
 volatile float grf_accel_fc = 25.0f;  /* z̈ 低通截止 Hz,悬空判定要快,压噪靠腿力通道 */
 volatile float grf_fleg_fc  = 60.0f;  /* 腿力低通截止 Hz,力矩噪声 ~0.5N,可放宽 */
 
-/* T2 悬空门控参数：站立 F_n≈55~65N,离地沿 0.1s 内掉到 40 以下(2026-11-02 实测),
- * 门限 20/35 迟留裕量充足;颠簸误触发靠双侧同时低+驻留时间兜底。 */
-volatile float grf_air_th_off = 20.0f;
-volatile float grf_air_th_on  = 35.0f;
-volatile uint16_t grf_air_hold_off = 50;  /* 50ms */
-volatile uint16_t grf_air_hold_on  = 20;  /* 20ms */
+/* T2 悬空门控参数（2026-11-02 第二版,改双侧均值判据）：
+ * v1 教训: 双侧绝对门限 20N 触发不了——LQR 活跃时 F_leg 被搅在 25~60N,
+ * "触发"需要系统先平静, 而平静需要先触发, 死锁(实测 CSV 同时最低 25/28N)。
+ * 改用 N_avg=(左+右)/2: 站地时前后加减速只挪两轮分摊不改总和(N_avg≈车重份),
+ * 对行驶天然免疫, 门限得以抬进实测悬空带(27~42N)上方。
+ * 实测(20:04 CSV): 站立 N_avg 58~64, 悬空最低 27 -> 40N 门限+100ms 驻留必触发,
+ * 站立裕量 18N。落地 N_avg 直接跳回 60 附近, 50N 穿越干脆。 */
+volatile float grf_air_th_off = 40.0f;
+volatile float grf_air_th_on  = 50.0f;
+volatile uint16_t grf_air_hold_off = 100; /* 100ms */
+volatile uint16_t grf_air_hold_on  = 50;  /* 50ms */
 static uint8_t grf_air = 0;
 static uint16_t grf_air_cnt = 0;
 
@@ -27,9 +32,10 @@ uint8_t GRF_Airborne(void) { return grf_air; }
 
 static void grf_air_update(float n_l, float n_r)
 {
+    float n_avg = 0.5f * (n_l + n_r);
     if (!grf_air)
     {
-        if (n_l < grf_air_th_off && n_r < grf_air_th_off)
+        if (n_avg < grf_air_th_off)
         {
             if (++grf_air_cnt >= grf_air_hold_off) { grf_air = 1; grf_air_cnt = 0; }
         }
@@ -37,7 +43,7 @@ static void grf_air_update(float n_l, float n_r)
     }
     else
     {
-        if (n_l > grf_air_th_on && n_r > grf_air_th_on)
+        if (n_avg > grf_air_th_on)
         {
             if (++grf_air_cnt >= grf_air_hold_on) { grf_air = 0; grf_air_cnt = 0; }
         }
