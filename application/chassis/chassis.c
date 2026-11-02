@@ -13,6 +13,7 @@
 #include "LQR.h"
 #include "controller.h"
 #include "VMC.h"
+#include "grf_observer.h"
 #include <math.h>
 
 
@@ -202,6 +203,7 @@ static void ChassisDbgLqr(const ten_balance_observation *o)
 void ChassisInit()
 {
     chassis_IMU_data = INS_Init();
+    GRF_Init(); /* GRF 地面反作用力观测器（手册第九章 T1） */
 
     chassis_cmd_sub = SubRegister("chassis_cmd", sizeof(Chassis_Ctrl_Cmd_s));
 
@@ -357,6 +359,11 @@ void ChassisTask()
     r_wheel_control(r_wheel_angle,r_wheel_w,&r_wheel);
     l_wheel_control(l_wheel_angle,l_wheel_w,&l_wheel);
     BalanceObserve(&ten_balance_observe);
+
+    /* GRF 观测器（T1）: 反馈力矩反推腿力 + IMU 竖直加速度,输出 ep 可读 grf_dbg */
+    GRF_Update(r_front_8009_motor->measure.torque, r_behind_8009_motor->measure.torque,
+               l_front_8009_motor->measure.torque, l_behind_8009_motor->measure.torque,
+               0.001f);
 
     /* ===== 倒地自起 v2（2026-11-01,南航金城式:姿态纠正+直接站立+变K）=====
      * 【当前 rec_enable=0 留存不启用】台架实测: 垫 15cm 可站起, 7cm 时 DONE
