@@ -11,7 +11,7 @@
 
 volatile GRF_Dbg_s grf_dbg;
 volatile float grf_m_w      = 0.5f;   /* 单侧轮+轮轴组件 kg,参数表 m_u,ep 可调 */
-volatile float grf_accel_fc = 25.0f;  /* z̈ 低通截止 Hz,悬空判定要快,压噪靠腿力通道 */
+volatile float grf_accel_fc = 35.0f;  /* z̈ 低通截止 Hz,悬空判定要快,压噪靠腿力通道 */
 volatile float grf_fleg_fc  = 60.0f;  /* 腿力低通截止 Hz,力矩噪声 ~0.5N,可放宽 */
 
 /* T2 悬空门控参数（2026-11-02 第二版,改双侧均值判据）：
@@ -19,20 +19,31 @@ volatile float grf_fleg_fc  = 60.0f;  /* 腿力低通截止 Hz,力矩噪声 ~0.5
  * "触发"需要系统先平静, 而平静需要先触发, 死锁(实测 CSV 同时最低 25/28N)。
  * 改用 N_avg=(左+右)/2: 站地时前后加减速只挪两轮分摊不改总和(N_avg≈车重份),
  * 对行驶天然免疫, 门限得以抬进实测悬空带(27~42N)上方。
- * 实测(20:04 CSV): 站立 N_avg 58~64, 悬空最低 27 -> 40N 门限+100ms 驻留必触发,
- * 站立裕量 18N。落地 N_avg 直接跳回 60 附近, 50N 穿越干脆。 */
-volatile float grf_air_th_off = 40.0f;
+ * 实测(20:04 CSV): 站立 N_avg 58~64, 悬空最低 27 -> 门限+100ms 驻留必触发,
+ * 站立裕量 18N。落地 N_avg 直接跳回 60 附近, 50N 穿越干脆。
+ * 2026-11-03 最终版: 弃武装门/旁路(垫高起立瞬态 N_avg 悬在 30~50 模糊带,
+ * 状态机在"切轮/疯转"间振荡, 实测站不起来), 改**死延时激活**——上电后
+ * 正常跑全量 LQR(行为同 GRF 之前), grf_air_delay ms 后检测才接入。 */
+volatile float grf_air_th_off = 30.0f;
 volatile float grf_air_th_on  = 50.0f;
 volatile uint16_t grf_air_hold_off = 100; /* 100ms */
 volatile uint16_t grf_air_hold_on  = 50;  /* 50ms */
+volatile uint16_t grf_air_delay    = 3000; /* 死延时 ms: 上电后检测静默期,盖住垫高起立全程 */
 static uint8_t grf_air = 0;
 static uint16_t grf_air_cnt = 0;
+static uint32_t grf_tick = 0;   /* 上电起累计 tick @1kHz */
 
 uint8_t GRF_Airborne(void) { return grf_air; }
 
 static void grf_air_update(float n_l, float n_r)
 {
     float n_avg = 0.5f * (n_l + n_r);
+
+    /* 死延时: 上电后 grf_air_delay ms 内 air 恒 0(检测不接入),
+     * 全量 LQR 正常跑; 延时只在这开闸一次, 之后不再有激活/撤销逻辑。 */
+    if (++grf_tick <= grf_air_delay)
+        return;
+
     if (!grf_air)
     {
         if (n_avg < grf_air_th_off)
@@ -77,6 +88,7 @@ void GRF_Init(void)
     lpf_fleg_l = lpf_fleg_r = lpf_zdd = lpf_fn_l = lpf_fn_r = (GRF_Lpf_s){0, 0};
     grf_air = 0;
     grf_air_cnt = 0;
+    grf_tick = 0;   /* 死延时从 Init 起算 */
 }
 
 void GRF_Update(float r_Tf, float r_Tb, float l_Tf, float l_Tb, float dt)

@@ -35,11 +35,12 @@ extern volatile float grf_m_w;        /* 单侧轮+轮轴组件质量 kg（参�
 extern volatile float grf_accel_fc;   /* z̈ LPF 截止频率 Hz */
 extern volatile float grf_fleg_fc;    /* 腿力 LPF 截止频率 Hz */
 
-/* ===== T2 悬空门控（迟滞+驻留,防颠簸误触发）===== */
+/* ===== T2 悬空门控（迟滞+驻留+死延时激活）===== */
 extern volatile float grf_air_th_off;      /* 离地门限 N：双侧 F_n 低于此 */
 extern volatile float grf_air_th_on;       /* 落地门限 N：双侧 F_n 高于此（迟滞） */
 extern volatile uint16_t grf_air_hold_off; /* 离地判定驻留 tick @1kHz */
 extern volatile uint16_t grf_air_hold_on;  /* 落地判定驻留 tick @1kHz */
+extern volatile uint16_t grf_air_delay;    /* 死延时 ms：上电后检测静默期,期间 air 恒 0 */
 uint8_t GRF_Airborne(void);                /* 1=悬空 0=触地（本拍状态机输出） */
 
 void GRF_Init(void);

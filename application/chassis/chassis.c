@@ -49,8 +49,8 @@ static Chassis_Ctrl_Cmd_s chassis_cmd_recv;
  * tanh 平滑过零防 1kHz 抖振。T_c 为 volatile 全局，可在调试器在线调：
  * 左腿 0.5 起调（手测静摩擦大），右腿先 0（过补会变负阻尼、诱发极限环）。
  * 判据：左右腿手掰阻力对称；注意 ω=0 时补偿为 0，静止突破仍靠平衡自振。 */
-volatile float l_joint_fric_t = 0.5f;   /* N·m/关节, 左腿 */
-volatile float r_joint_fric_t = 0.25f;   /* N·m/关节, 右腿 */
+volatile float l_joint_fric_t = 0.91f;   /* N·m/关节, 左腿 */
+volatile float r_joint_fric_t = 0.35f;   /* N·m/关节, 右腿 */
 #define FRICTION_TANH_W0  (0.15f)       /* rad/s, tanh 速度平滑尺度 */
 
 /* ===== 轮端库仑摩擦前馈（2026-10-31）=====
@@ -77,7 +77,7 @@ volatile float roll_kd    = 20.0f;      /* N/(rad/s), roll 补偿阻尼 */
 /* ===== 倒地自起参数（2026-11-01, volatile 支持 ep 在线整定）===== */
 volatile uint8_t rec_enable = 0;   /* 总开关: 0=留存不启用(上电直接站立基线) 1=启用状态机 */
 volatile float rec_l_min      = 0.13f;   /* 收拢位腿长 m（实车:倒地收拢物理下限约 0.124~0.13,硬顶 0.11 会一直顶力）*/
-volatile float rec_l_stand    = 0.30f;   /* 起立目标腿长 m */
+volatile float rec_l_stand    = 0.11f;   /* 起立目标腿长 m */
 volatile float rec_ramp_speed = 0.0002f; /* 腿长目标变化速率 m/tick = 2cm/s @1kHz */
 volatile float rec_kp_theta   = 9.7f;    /* 摆角归零 PD（与 K 矩阵 lθ 行增益同量级）*/
 volatile float rec_kd_theta   = 1.23f;
@@ -87,6 +87,24 @@ volatile float rec_eps_len    = 0.03f;   /* FOLD/STAND 到位阈值: |L-Ldes| m,
 /* 到位确认需要条件连续保持的时间: 2026-11-01 实车发现倒地姿态下腿长/摆角
  * 被地面和机体撑住,严格阈值永远不满足 -> 改"目标附近 + 驻留确认" */
 volatile uint16_t rec_hold_ticks = 500;  /* 0.5s @1kHz */
+/* 趴地恢复瞬态软化（2026-11-03）: 上电趴地 θ 误差 0.68 阶跃 -> LQR Tp 满力矩
+ * 0.5s 打穿零点, 反作用力推 s 冲 0.62m / yaw 甩 1.17rad(实测 CSV)。
+ * 修法 = 摆角目标从实测值以 rec_theta_rate 斜坡收向 0, LQR 全程小误差运行。
+ * prone_rec_state: ep 可读, 0=判定中 1=摆角斜坡 2=腿长上升 3=完成 */
+volatile uint8_t prone_rec_state = 0;
+volatile float rec_theta_rate  = 6.0f;   /* rad/s, 摆角目标收拢速率 */
+/* 完成判据(2026-11-03 按 230249 CSV 标定): 稳态 |θ|<=0.13/|φ|<=0.04,
+ * 瞬态 θ 过冲 0.35/φ 一闪 0.10 —— 阈值取稳态 2 倍且低于瞬态峰值,
+ * 驻留 0.5s 滤穿越(穿越带时长 <0.3s)。实测判成时刻 ~4.5s。 */
+volatile float rec_center_band = 0.25f;  /* rad, 摆角平衡判定带 */
+volatile float rec_phi_band    = 0.08f;  /* rad, 俯仰平衡判定带 */
+volatile float dbg_th0_l = 0.0f;         /* ep 可读: 左腿锚定 θ0 */
+volatile float dbg_th0_r = 0.0f;         /* ep 可读: 右腿锚定 θ0 */
+/* 腿长上升段(态2): 判成后腿长目标从锚定实测值匀速爬向 rec_l_rise。
+ * 轮不加门控(趴地位形轮全程接地, v2 的 0.27 门控假设不成立),
+ * Tw 常开与已验证的平衡段行为一致。 */
+volatile float rec_l_rise     = 0.30f;    /* 上升目标腿长 m */
+volatile float rec_rise_speed = 0.0001f; /* m/tick = 10cm/s @1kHz */
 /* FOLD 后腿长目标直接跳站立位(南航金城式,无中间斜坡), 防弹车两件套:
  * 1) 误差门限幅: |目标-实测|>rec_push_band 期间腿长 PID 分量钳到 ±rec_push_max
  *    (等效他们 stand_PID 的 20N MaxOut), 误差进带恢复 ±LEG_PID_OUT_MAX;
@@ -101,11 +119,10 @@ volatile float rec_wheel_margin = 0.03f;   /* 轮使能门限 = 站立腿长 - �
  * STAND 起立后腿要承重, 切回 LEG_GRAVITY_FF。 */
 volatile float rec_gravity_ff = 8.0f;    /* N/腿, FOLD 阶段 */
 
-/* ===== T2 GRF 悬空门控（2026-11-02）=====
- * 悬空期 Tp 弃 LQR, 换摆角纯阻尼(腿自然下垂归位); 轮力矩在输出端清零。
- * kd 过大->悬空时腿抖; 过小->腿摆收不住, 落地姿态差。 */
-volatile float air_swing_kd = 2.0f;      /* N·m/(rad/s), 摆角阻尼 */
-volatile float air_tp_max   = 6.0f;      /* N·m, 悬空期 Tp 限幅 */
+/* ===== T2 GRF 悬空门控（2026-11-03 改手册第九章降维）=====
+ * 悬空时 LQR_SetAir(1): K 矩阵轮相关值清零——Tw 整行清零,
+ * Tp 跳过 s|ds|yaw|dyaw 列, 腿被 LQR 主动锁在目标位(§10.3)。
+ * 输出端 Tw 再硬清一道双保险, 见 ChassisTask 悬空分支。 */
 
 /* 腿长速度估计状态（P-P 级联的阻尼项用） */
 typedef struct
@@ -477,6 +494,7 @@ void ChassisTask()
      * 倒地自起 FOLD 阶段整段跳过;DONE 恢复运行,此时 lock/drive/standing
      * 锁存均为 0,首拍走进入沿锚定。腿长目标由恢复流程恒置站立位。 */
     uint8_t air_state = GRF_Airborne(); /* T2 悬空快照,FOLD 期间也有效(轮输出端共用) */
+    LQR_SetAir(air_state);              /* 悬空降维同步给 LQR(手册ch9: 轮相关通道清零) */
     if (rec_state != 0)
     {
     /* drive 在函数级作用域: 目标生成分支共用 */
@@ -546,29 +564,127 @@ void ChassisTask()
     yaw_ref_err -= 2.0f * PI * roundf(yaw_ref_err / (2.0f * PI));
     ten_targets.yaw_target = ten_balance_observe.yaw + yaw_ref_err;
 
+    /* ===== 趴地恢复瞬态软化（2026-11-03, 覆盖上面所有目标生成）=====
+     * 进入: 首个有效观测帧(L>0.05, 上电前几拍读数为 0)双腿均腿长 <0.13
+     *       -> 锚定 θ0 与 s/yaw 目标; 站立上电(L>=0.13)永久旁路。
+     * 恢复: 摆角目标 = sign(θ0)·max(|θ0|-rate·t, 0), dθ 目标 0,
+     *       LQR 见到的误差从 0 开始线性增大, Tp 恒小 -> s/yaw 不甩。
+     * 完成: 双腿 |θ|<rec_center_band 驻留 rec_hold_ticks -> 退出(目标归常规)。
+     * 腿长目标仍由 rec_l_stand 决定(趴地测试=0.11), 伸腿另行阶梯/斜坡。 */
+    static uint16_t prone_hold = 0;
+    static uint16_t prone_valid = 0;
+    static float prone_t = 0.0f;
+    if (prone_rec_state == 0)
+    {
+        float ll = ten_balance_observe.l_leg_length;
+        float rl = ten_balance_observe.r_leg_length;
+        /* 双腿观测都有效且连续 50ms 才判定: 单腿先就绪时平均腿长也能过 0.05,
+         * 会把另一腿的垃圾值/瞬态半途锚成 θ0(2026-11-03 实测 dbg_th0_l=-0.56) */
+        if (ll > 0.05f && rl > 0.05f)
+        {
+            if (++prone_valid >= 50)
+            {
+                /* 趴地(均腿长<0.13)进摆角斜坡; 站立上电直接进上升段
+                 * (锚定实测≈0.30, 斜坡空转, 且修复站立上电目标曾是 0.11 的问题) */
+                prone_rec_state = (0.5f * (ll + rl) < 0.13f) ? 1 : 2;
+                if (prone_rec_state == 1)
+                {
+                    dbg_th0_l = ten_balance_observe.l_theta;
+                    dbg_th0_r = ten_balance_observe.r_theta;
+                    LIMIT_MIN_MAX(dbg_th0_l, -1.4f, 1.4f);
+                    LIMIT_MIN_MAX(dbg_th0_r, -1.4f, 1.4f);
+                    ten_targets.s_target   = ten_balance_observe.s;
+                    ten_targets.yaw_target = ten_balance_observe.yaw;
+                }
+            }
+        }
+        else
+        {
+            prone_valid = 0;
+        }
+    }
+    if (prone_rec_state == 1)
+    {
+        prone_t += 0.001f;   /* ChassisTask 1kHz */
+        float step = rec_theta_rate * prone_t;
+        float ml = fabsf(dbg_th0_l) - step; if (ml < 0.0f) ml = 0.0f;
+        float mr = fabsf(dbg_th0_r) - step; if (mr < 0.0f) mr = 0.0f;
+        ten_targets.l_theta_target  = (dbg_th0_l >= 0.0f) ? ml : -ml;
+        ten_targets.r_theta_target  = (dbg_th0_r >= 0.0f) ? mr : -mr;
+        ten_targets.l_dtheta_target = 0.0f;
+        ten_targets.r_dtheta_target = 0.0f;
+        if (fabsf(ten_balance_observe.l_theta) < rec_center_band &&
+            fabsf(ten_balance_observe.r_theta) < rec_center_band &&
+            fabsf(ten_balance_observe.phi)     < rec_phi_band)
+        {
+            if (++prone_hold >= rec_hold_ticks)
+                prone_rec_state = 2;
+        }
+        else
+        {
+            prone_hold = 0;
+        }
+    }
+
+    /* ===== 态2: 腿长上升段(2026-11-03) =====
+     * 进入沿锚定实测腿长, 按 rec_rise_speed 匀速爬向 rec_l_rise;
+     * L_avg 进 rec_l_rise-rec_eps_len 驻留 rec_hold_ticks -> 态3。
+     * 轮不加门控: 趴地位形轮全程接地(实测 0.11 就在滑), v2 的"0.27 才触地"
+     * 假设不成立; Tw 常开 = 已验证平衡段的配置。
+     * 态3: 腿长目标恒 rec_l_rise。站立上电也走 2->3(锚定 0.30, 斜坡空转)。 */
+    static uint8_t  rise_anchor = 0;
+    static uint16_t rise_hold = 0;
+    static float rise_l = 0.30f, rise_r = 0.30f;
+    if (prone_rec_state == 2)
+    {
+        if (!rise_anchor)
+        {
+            rise_l = ten_balance_observe.l_leg_length;
+            rise_r = ten_balance_observe.r_leg_length;
+            LIMIT_MIN_MAX(rise_l, 0.09f, 0.40f);
+            LIMIT_MIN_MAX(rise_r, 0.09f, 0.40f);
+            rise_anchor = 1;
+            rise_hold = 0;
+        }
+        if (rise_l < rec_l_rise) rise_l += rec_rise_speed;
+        if (rise_r < rec_l_rise) rise_r += rec_rise_speed;
+        ten_targets.l_leg_length_target = rise_l;
+        ten_targets.r_leg_length_target = rise_r;
+        float L_avg = 0.5f * (ten_balance_observe.l_leg_length +
+                              ten_balance_observe.r_leg_length);
+        if (L_avg >= rec_l_rise - rec_eps_len)
+        {
+            if (++rise_hold >= rec_hold_ticks)
+                prone_rec_state = 3;
+        }
+        else
+        {
+            rise_hold = 0;
+        }
+    }
+    else if (prone_rec_state == 3)
+    {
+        ten_targets.l_leg_length_target = rec_l_rise;
+        ten_targets.r_leg_length_target = rec_l_rise;
+    }
+
     LQR_calc(&ten_balance_observe,&ten_targets,&four_control_datas);
     chassis_dbg.lqr_u[0] = four_control_datas.l_Tw;
     chassis_dbg.lqr_u[1] = four_control_datas.r_Tw;
     chassis_dbg.lqr_u[2] = four_control_datas.l_Tp;
     chassis_dbg.lqr_u[3] = four_control_datas.r_Tp;
 
-    /* ===== T2: GRF 悬空门控（2026-11-02 实测驱动）=====
-     * 悬空时 LQR 即正反馈(实测: 轮疯转+摆角甩到轮心过髋), 处置:
-     * Tw/Tp 弃 LQR, Tp 换摆角纯阻尼(腿自然下垂), 腿长伺服保持站立位;
-     * 轮力矩在下方输出端清零(止疯转, 也消 Tw 反作用对力矩反推的污染)。
-     * 腿摆住后 F_leg 卸到 -m_w·g, F_n 干净归 0;
+    /* ===== T2: GRF 悬空门控（2026-11-03 手册第九章降维）=====
+     * 悬空时 LQR_SetAir 已把 K 矩阵轮相关值清零: Tw=0(止疯转),
+     * Tp 保留 φ/φ̇+腿摆角通道 → 腿被 LQR 主动锁在目标位, 不再阻尼下垂。
+     * 此处输出端 Tw 硬清一道双保险(也消 Tw 反作用对力矩反推的污染)。
+     * 腿锁住后 F_leg 卸到 -m_w·g, F_n 干净归 0;
      * 落地沿(F_n 双侧>th_on 驻留)恢复 LQR 并重锚定 s/yaw 清空转里程漂移。 */
     static uint8_t air_reanchor = 0;
     if (air_state)
     {
-        float tp_l = -air_swing_kd * ten_balance_observe.l_dtheta;
-        float tp_r = -air_swing_kd * ten_balance_observe.r_dtheta;
-        LIMIT_MIN_MAX(tp_l, -air_tp_max, air_tp_max);
-        LIMIT_MIN_MAX(tp_r, -air_tp_max, air_tp_max);
         four_control_datas.l_Tw = 0.0f;
         four_control_datas.r_Tw = 0.0f;
-        four_control_datas.l_Tp = tp_l;
-        four_control_datas.r_Tp = tp_r;
         air_reanchor = 1;
     }
     else if (air_reanchor)
@@ -611,6 +727,20 @@ void ChassisTask()
     chassis_dbg.Ldot[1] = r_dot;
     chassis_dbg.Roll = chassis_IMU_data->Roll;
     chassis_dbg.dFroll = dF_roll;
+
+    /* 观测无效期输出闸: 上电头几拍读数全 0, 腿长环却会以 30N/腿推腿,
+     * 折叠位形下该力把腿/轮推进入瞬态, 恢复锚定就锚到运动半途
+     * (2026-11-03 实测: dbg_th0_l=-0.56, 左轮 -408rad/s, s 冲 -0.69)。
+     * 判定完成(prone_rec_state 离开 0)前电机不出力, 腿由机械摩擦保持。 */
+    if (prone_rec_state == 0)
+    {
+        four_control_datas.l_Tp = 0.0f;
+        four_control_datas.r_Tp = 0.0f;
+        four_control_datas.l_Tw = 0.0f;
+        four_control_datas.r_Tw = 0.0f;
+        four_control_datas.l_Tleg = 0.0f;
+        four_control_datas.r_Tleg = 0.0f;
+    }
 
     VMC_Calc(&four_control_datas, &r_leg_motor_torques, &r_leg);
     l_VMC_Calc(&four_control_datas, &l_leg_motor_torques, &l_leg);
