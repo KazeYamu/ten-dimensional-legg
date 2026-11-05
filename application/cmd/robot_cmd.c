@@ -382,7 +382,7 @@ void RobotCMDTask()
     CalcOffsetAngle();
 #if WHEELLEG_REMOTE_MODE == WHEELLEG_REMOTE_NONE
     /* 站立调试模式: 不响应任何遥控输入,发布站立测试基线
-     * (chassis侧收到 CHASSIS_STANDING_TEST 后目标全零,仅腿长保持0.3m) */
+     * (chassis侧收到 CHASSIS_STANDING_TEST 后目标全零,仅腿长保持0.25m(rec_l_rise)) */
     chassis_cmd_send.vx           = 0.0f;
     chassis_cmd_send.vy           = 0.0f;
     chassis_cmd_send.wz           = 0.0f;

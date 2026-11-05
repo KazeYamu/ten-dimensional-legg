@@ -21,7 +21,7 @@
 
 /* ===== 轮腿遥控接入模式(编译期切换,改后需重编译) =====
  * WHEELLEG_REMOTE_NONE: 不接遥控,纯站立调试。robot_cmd 每拍发布
- *   CHASSIS_STANDING_TEST,chassis 按原始硬编码基线跑(全零目标+腿长0.3m)。
+ *   CHASSIS_STANDING_TEST,chassis 按原始硬编码基线跑(全零目标+腿长0.25m(rec_l_rise))。
  * WHEELLEG_REMOTE_SBUS: FS-i6X + iA6B (SW2三档=模式, SwA两档=急停)。
  * WHEELLEG_REMOTE_DBUS: DT7 (左开关下=遥控, 右开关下=急停),解析走DBUS分支。 */
 #define WHEELLEG_REMOTE_NONE 0
@@ -123,7 +123,7 @@ typedef enum
     CHASSIS_NO_FOLLOW,         // 不跟随，允许全向平移
     CHASSIS_FOLLOW_GIMBAL_YAW, // 跟随模式，底盘叠加角度环控制
     CHASSIS_WHEELLEG_DRIVE,    // 轮腿遥控行驶: vx=前后速度指令(m/s), wz=转向角速度指令(rad/s)
-    CHASSIS_STANDING_TEST,     // 轮腿站立调试: 全零目标+腿长0.3m,与未接遥控的硬编码基线一致
+    CHASSIS_STANDING_TEST,     // 轮腿站立调试: 全零目标+腿长0.25m(rec_l_rise),与未接遥控的硬编码基线一致
 } chassis_mode_e;
 
 // 云台模式设置

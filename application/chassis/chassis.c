@@ -39,8 +39,9 @@ static Chassis_Ctrl_Cmd_s chassis_cmd_recv;
  * 静止时不漂（无积分无陀螺），代价：站立不再锁世界航向，比赛需要时另加 IMU 外环。 */
 #define TRACK_HALF_WIDTH  (0.24f)                 /* 半轮距 m,= params.py R_L */
 #define WHEEL_RADIUS      (0.06f)                 /* 驱动轮半径 m,= params.py R_W */
-#define YAW_COEF_WHEEL    (1.0f / (2.0f * TRACK_HALF_WIDTH))                            /* 2.083 */
-#define YAW_COEF_LEG      ((WHEEL_RADIUS + 0.3f) / (2.0f * TRACK_HALF_WIDTH))           /* 0.75 */
+#define YAW_COEF_WHEEL    (1.0f / (2.0f * TRACK_HALF_WIDTH))                            /* 2.083, 与腿长无关(design.py Cq 推导) */
+/* YAW_COEF_LEG 已删除: 腿角项系数 (R+l)/(2R_L) 含腿长, 改为 ChassisTask 内
+ * 用 rec_l_rise 现算联动, 防止改站立腿长时忘同步偏航模型(2026-11-05)。 */
 
 /* ===== 关节库仑摩擦前馈（2026-10-30）=====
  * 实测左髋静摩擦 ≥2 N·m（右腿可随意掰动，左腿小腿需相当力气），死区让 LQR 的
@@ -103,7 +104,7 @@ volatile float dbg_th0_r = 0.0f;         /* ep 可读: 右腿锚定 θ0 */
 /* 腿长上升段(态2): 判成后腿长目标从锚定实测值匀速爬向 rec_l_rise。
  * 轮不加门控(趴地位形轮全程接地, v2 的 0.27 门控假设不成立),
  * Tw 常开与已验证的平衡段行为一致。 */
-volatile float rec_l_rise     = 0.30f;    /* 上升目标腿长 m */
+volatile float rec_l_rise     = 0.25f;    /* 上升目标腿长 m = 站立/行驶腿长(唯一真源,偏航模型系数联动) */
 volatile float rec_rise_speed = 0.0001f; /* m/tick = 10cm/s @1kHz */
 /* FOLD 后腿长目标直接跳站立位(南航金城式,无中间斜坡), 防弹车两件套:
  * 1) 误差门限幅: |目标-实测|>rec_push_band 期间腿长 PID 分量钳到 ±rec_push_max
@@ -405,7 +406,7 @@ void ChassisTask()
     static uint8_t rec_wheels_on = 0;  /* 恢复期轮使能锁存 */
     static uint8_t rec_reanchor_req = 0; /* 轮使能沿 -> 重锚定 s/yaw 请求 */
     static uint16_t rec_hold = 0;      /* 到位条件连续满足计数(驻留确认) */
-    static float l_leg_ramp = 0.30f, r_leg_ramp = 0.30f;
+    static float l_leg_ramp = 0.25f, r_leg_ramp = 0.25f;
     if (!rec_enable)
     {
         /* 总开关关闭(留存不启用): 上电直接站立基线,
@@ -471,11 +472,13 @@ void ChassisTask()
     chassis_dbg.rec_state = (float)rec_state;
 
     /* 模型一致 yaw：用里程计+腿角差重构 model_lagrange.py 的 ψ（见文件头部说明）。
-     * BalanceObserve 里的 IMU yaw/dyaw 在此被整体替换；IMU 仅保留 φ/roll 用途。 */
+     * BalanceObserve 里的 IMU yaw/dyaw 在此被整体替换；IMU 仅保留 φ/roll 用途。
+     * 腿角项系数 (R+l)/(2R_L) 随站立腿长 rec_l_rise 联动, 改腿长不丢同步。 */
+    float yaw_coef_leg = (WHEEL_RADIUS + rec_l_rise) / (2.0f * TRACK_HALF_WIDTH);
     ten_balance_observe.yaw = YAW_COEF_WHEEL * (r_wheel.r_x - l_wheel.l_x)
-                            + YAW_COEF_LEG * (ten_balance_observe.l_theta - ten_balance_observe.r_theta);
+                            + yaw_coef_leg * (ten_balance_observe.l_theta - ten_balance_observe.r_theta);
     ten_balance_observe.dyaw = YAW_COEF_WHEEL * (r_wheel.r_dx - l_wheel.l_dx)
-                             + YAW_COEF_LEG * (ten_balance_observe.l_dtheta - ten_balance_observe.r_dtheta);
+                             + yaw_coef_leg * (ten_balance_observe.l_dtheta - ten_balance_observe.r_dtheta);
     ChassisDbgLqr(&ten_balance_observe);
 
     /* 轮使能沿: 重锚定 s/yaw, 清掉 FOLD 后腿伸长期间轮子自由滚动累计的里程漂移 */
@@ -501,7 +504,7 @@ void ChassisTask()
     uint8_t drive = (chassis_cmd_recv.chassis_mode == CHASSIS_WHEELLEG_DRIVE);
     if (chassis_cmd_recv.chassis_mode == CHASSIS_STANDING_TEST)
     {
-        /* 站立调试基线: 除 yaw 外全零(腿长0.3m已在上方设置)。
+        /* 站立调试基线: 除 yaw 外全零(腿长0.25m=rec_l_rise已在上方设置)。
          * yaw_target 进入沿锚定当前 ψ 后冻结——里程计 ψ 会随推车/弧线漂移累计
          * 差动轮里程,若硬编码 0 会产生常值 yaw 误差 → 常值差动 Tp → 单腿被压死。
          * drive_last 置0,退出本模式后按进入沿重新锚定/冻结。 */
@@ -634,7 +637,7 @@ void ChassisTask()
      * 态3: 腿长目标恒 rec_l_rise。站立上电也走 2->3(锚定 0.30, 斜坡空转)。 */
     static uint8_t  rise_anchor = 0;
     static uint16_t rise_hold = 0;
-    static float rise_l = 0.30f, rise_r = 0.30f;
+    static float rise_l = 0.25f, rise_r = 0.25f;
     if (prone_rec_state == 2)
     {
         if (!rise_anchor)
