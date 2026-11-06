@@ -66,7 +66,7 @@ volatile float l_wheel_fric_t = 0.05f;  /* N·m/轮, 左轮 */
 #define WHEEL_FRICTION_TANH_V0 (0.03f)  /* m/s, tanh 速度平滑尺度(轮缘线速度) */
 
 /* ===== 腿长刚度 + Roll 补偿（2026-11-01 加强,原为宏 800/100/100/10）=====
- * 加强依据: 右倾1.3°的静态账 = 腿长下垂差(6.5N/800≈8mm→1.0°) + roll补偿过弱
+ * 加强依据: 右倾1.3°的静态偏移 = 腿长下垂差(6.5N/800≈8mm→1.0°) + roll补偿过弱
  * (KP=100 时 1.3° 仅出力 2.3N)。KP 翻倍 + roll KP 4 倍后残余预计 0.2~0.3°。
  * volatile 支持 ep 在线整定; 腿抖→Kp 减回 1200 或 Kv 单独加到 250;
  * 低频晃动→roll_kp 降到 250。 */
@@ -119,6 +119,31 @@ volatile float rec_wheel_margin = 0.03f;   /* 轮使能门限 = 站立腿长 - �
  * 收拢平衡点被抬高 50/1600≈3.1cm(≈0.14m), 腿长永远进不了 ±1cm 判据。
  * STAND 起立后腿要承重, 切回 LEG_GRAVITY_FF。 */
 volatile float rec_gravity_ff = 8.0f;    /* N/腿, FOLD 阶段 */
+
+/* ===== T3/T4 翻倒保护 + 过渡段（2026-11-05, SPR 式, volatile 供 ep 整定）=====
+ * 判据与动作全部基于腿摆角 θ_body（纯编码器量, 见监控块注释）,
+ * 不用欧拉角判翻倒（EKF Pitch=atan2/Roll=asinf 值域均 ±90°, 翻倒后折返）。
+ * 流程: 运行中 |θ_body| 出窗 -> 脱力进态4 -> 操作手"切零力再切出"确认 ->
+ *       态4 翻身(伸腿 0.40 造支点 + 追赶式恒速摆腿, SPR 同款) ->
+ *       态5 收腿小板凳(L=rec_l_min, θ_body->0) -> 接现有态1 斜坡。 */
+volatile uint8_t  prot_enable     = 0;      /* 0=运行中监控不跑(默认,先配数) 1=出窗脱力+进态4 */
+volatile float    prot_theta_th   = 1.3f;   /* |θ_body| 出窗阈值 rad（SPR 窗口外沿 ~1.2） */
+volatile uint16_t prot_hold       = 200;    /* 出窗驻留 tick @1kHz */
+volatile float    prot_l_max      = 0.40f;  /* 态4 腿长目标 m: 伸到最长造支点（SPR 同款） */
+volatile float    prot_l_speed    = 0.0005f;/* 态4 伸腿速率 m/tick = 50cm/s */
+volatile float    prot_step       = 0.3f;   /* 追赶式摆角超前量 rad（SPR 同款, 恒速摆+抗卡滞） */
+volatile float    prot_step_far   = 0.6f;   /* 双腿差>prot_diff_th 时落后腿的步长（差速纠偏） */
+volatile float    prot_diff_th    = 0.8f;   /* 双腿 θ_body 差超此值触发差速 rad */
+volatile float    prot_dir_sign   = 1.0f;   /* 摆腿总方向: 实测方向反了整体改 -1 */
+volatile float    prot_kp_theta   = 30.0f;  /* 态4/5 θ_body PD: 追赶式下 Tp≈kp*step 恒推 */
+volatile float    prot_kd_theta   = 2.0f;   /* 阻尼防摆飞 */
+volatile float    prot_tp_max     = 18.0f;  /* 态4/5 Tp 限幅 N·m（要顶得动机体, 大于 rec_tp_max） */
+volatile float    prot_pitch_back = -1.0f;  /* Pitch(rad) 小于此值摆腿反向（SPR :443, ±90° 内可靠） */
+volatile float    prot_pitch_exit = 0.3f;   /* 态4 出口: |Pitch|<此值 才算机身翻正 */
+volatile float    prot_theta_win  = 1.2f;   /* 态4 出口: 双腿 |θ_body|<此值 才算回窗口 */
+volatile float    prot_band5      = 0.2f;   /* 态5 出口: 双腿 |θ_body| 进带 */
+volatile uint16_t prot_timeout    = 8000;   /* 态4/5 启动后超时 tick -> 回脱力等重新切档 */
+volatile uint8_t  prot_force_arm  = 0;      /* ep 置 1 跳过切档直接武装（调试用, 武装后自动清零） */
 
 /* ===== T2 GRF 悬空门控（2026-11-03 改手册第九章降维）=====
  * 悬空时 LQR_SetAir(1): K 矩阵轮相关值清零——Tw 整行清零,
@@ -389,6 +414,17 @@ void ChassisTask()
                l_front_8009_motor->measure.torque, l_behind_8009_motor->measure.torque,
                0.001f);
 
+    /* ===== T3 机体系摆角 θ_body（2026-11-05, 函数级作用域）=====
+     * balance.c:96 里 l_theta = θ_body − Pitch·rad, 加回来即得"腿相对机体竖直"
+     * 的角 = 纯编码器运动学量, 与 IMU 姿态无关, 翻倒/欧拉角折返时依然有效
+     * （数学恒等抵消, 非近似）。T3 监控、态4/5、输出闸、dbg 填充共用。 */
+    float pitch_rad = chassis_IMU_data->Pitch * 0.01745329252f;
+    float l_theta_body = ten_balance_observe.l_theta + pitch_rad;
+    float r_theta_body = ten_balance_observe.r_theta + pitch_rad;
+    static uint16_t prot_cnt = 0;
+    static uint8_t  prot_armed = 0;
+    static uint8_t  prot_seen_zf = 0;
+
     /* ===== 倒地自起 v2（2026-11-01,南航金城式:姿态纠正+直接站立+变K）=====
      * 【当前 rec_enable=0 留存不启用】台架实测: 垫 15cm 可站起, 7cm 时 DONE
      * 瞬间 LQR 在低腿长大 φ 误差下 Tp 猛甩向后倒——后续按手册第九章
@@ -577,6 +613,8 @@ void ChassisTask()
     static uint16_t prone_hold = 0;
     static uint16_t prone_valid = 0;
     static float prone_t = 0.0f;
+    /* T3 机体系摆角 θ_body / prot_armed 等已在本函数开头(GRF_Update 后)计算,
+     * 见该处注释; 此处不再重复赋值。 */
     if (prone_rec_state == 0)
     {
         float ll = ten_balance_observe.l_leg_length;
@@ -606,6 +644,133 @@ void ChassisTask()
             prone_valid = 0;
         }
     }
+    /* ===== 态4: 翻倒过渡/翻身（2026-11-05, SPR chassis_task.c:431 同款）=====
+     * 进态即脱力（输出闸清零），等操作手"切零力再切出"的确认沿才武装
+     * （检测→脱力无害，动作需人确认——11-03 教训的隔离层; prot_force_arm 供 ep 跳过）。
+     * 武装后: 腿长匀速伸到 prot_l_max 造支点 + θ_body 追赶式目标恒速摆
+     * （目标=实测∓step 每拍重设: 腿能动则恒速摆, 被压住则目标跟着实测走、永不失配）。
+     * 方向按 Pitch 符号（prot_pitch_back 反向, 仅 ±90° 可靠区间）; 双腿差大时差速纠偏。
+     * 到位（机身翻正+双腿回窗）驻留 -> 态5; 超时回脱力等重新切档。 */
+    static uint8_t  tilt4_anchor = 0;
+    static uint16_t tilt4_t = 0;
+    static uint16_t tilt4_hold = 0;
+    static float tilt4_l = 0.25f, tilt4_r = 0.25f;
+    if (prone_rec_state == 4)
+    {
+        /* 启动闸门: 先见过零力档再切出 = 操作手确认 */
+        if (chassis_cmd_recv.chassis_mode == CHASSIS_ZERO_FORCE)
+            prot_seen_zf = 1;
+        else if (prot_seen_zf || prot_force_arm)
+        {
+            prot_armed = 1;
+            prot_seen_zf = 0;
+            prot_force_arm = 0;
+        }
+        if (prot_armed)
+        {
+            if (!tilt4_anchor)
+            {
+                tilt4_l = ten_balance_observe.l_leg_length;
+                tilt4_r = ten_balance_observe.r_leg_length;
+                LIMIT_MIN_MAX(tilt4_l, 0.09f, 0.40f);
+                LIMIT_MIN_MAX(tilt4_r, 0.09f, 0.40f);
+                tilt4_anchor = 1;
+                tilt4_t = 0;
+                tilt4_hold = 0;
+            }
+            tilt4_t++;
+            if (tilt4_l < prot_l_max) tilt4_l += prot_l_speed;
+            if (tilt4_r < prot_l_max) tilt4_r += prot_l_speed;
+            ten_targets.l_leg_length_target = tilt4_l;
+            ten_targets.r_leg_length_target = tilt4_r;
+            /* 追赶式摆角目标（世界系 θ 目标仅占位, LQR 输出随后被覆盖） */
+            float dir = prot_dir_sign * ((pitch_rad < prot_pitch_back) ? 1.0f : -1.0f);
+            float step_l = prot_step, step_r = prot_step;
+            if (fabsf(l_theta_body - r_theta_body) > prot_diff_th)
+            {   /* 差速: 摆角落后的腿步长加倍（SPR 固定右腿加倍, 这里按实测动态选） */
+                if (fabsf(l_theta_body) > fabsf(r_theta_body)) step_r = prot_step_far;
+                else                                           step_l = prot_step_far;
+            }
+            ten_targets.l_theta_target = l_theta_body + dir * step_l;
+            ten_targets.r_theta_target = r_theta_body + dir * step_r;
+            if (fabsf(pitch_rad) < prot_pitch_exit &&
+                fabsf(l_theta_body) < prot_theta_win &&
+                fabsf(r_theta_body) < prot_theta_win)
+            {
+                if (++tilt4_hold >= rec_hold_ticks)
+                {
+                    prone_rec_state = 5;
+                    tilt4_anchor = 0;
+                }
+            }
+            else
+            {
+                tilt4_hold = 0;
+            }
+            if (tilt4_t > prot_timeout)
+            {   /* 超时: 回脱力等重新切档, 防卡死顶死。
+                 * seen_zf 必须一并清零, 否则残留的"已见零力"会让操作手
+                 * 不做任何确认就自动再武装（闸门失效）。 */
+                prot_armed = 0;
+                prot_seen_zf = 0;
+                tilt4_anchor = 0;
+            }
+        }
+    }
+
+    /* ===== 态5: 收腿小板凳（2026-11-05, SPR FALLING_TO_STANDING:481 同款位形）=====
+     * L -> rec_l_min + θ_body -> 0, 纯关节 PD, Tw=0, 小重力前馈。
+     * 到位（双腿摆角进带 + 腿长到位）驻留 -> 接态1（重锚定 θ0 斜坡, 基本空转穿过）
+     * -> 态2 爬升 -> 态3, 后段零改动复用。 */
+    static uint8_t  tilt5_anchor = 0;
+    static uint16_t tilt5_t = 0;
+    static uint16_t tilt5_hold = 0;
+    if (prone_rec_state == 5)
+    {
+        if (!tilt5_anchor)
+        {
+            tilt5_t = 0;
+            tilt5_hold = 0;
+            tilt5_anchor = 1;
+        }
+        tilt5_t++;
+        ten_targets.l_leg_length_target = rec_l_min;
+        ten_targets.r_leg_length_target = rec_l_min;
+        ten_targets.l_theta_target = 0.0f;   /* 占位, LQR 输出随后被覆盖 */
+        ten_targets.r_theta_target = 0.0f;
+        if (fabsf(l_theta_body) < prot_band5 &&
+            fabsf(r_theta_body) < prot_band5 &&
+            fabsf(ten_balance_observe.l_leg_length - rec_l_min) < rec_eps_len &&
+            fabsf(ten_balance_observe.r_leg_length - rec_l_min) < rec_eps_len)
+        {
+            if (++tilt5_hold >= rec_hold_ticks)
+            {
+                /* 接态1: 重锚定世界系 θ0 + s/yaw（同态0 趴地进入沿） */
+                dbg_th0_l = ten_balance_observe.l_theta;
+                dbg_th0_r = ten_balance_observe.r_theta;
+                LIMIT_MIN_MAX(dbg_th0_l, -1.4f, 1.4f);
+                LIMIT_MIN_MAX(dbg_th0_r, -1.4f, 1.4f);
+                ten_targets.s_target   = ten_balance_observe.s;
+                ten_targets.yaw_target = ten_balance_observe.yaw;
+                prone_t = 0.0f;
+                prone_hold = 0;
+                prone_rec_state = 1;
+                tilt5_anchor = 0;
+            }
+        }
+        else
+        {
+            tilt5_hold = 0;
+        }
+        if (tilt5_t > prot_timeout)
+        {   /* 超时: 回态4 脱力等重新切档（seen_zf 一并清零, 理由同态4 超时） */
+            prot_armed = 0;
+            prot_seen_zf = 0;
+            tilt5_anchor = 0;
+            prone_rec_state = 4;
+        }
+    }
+
     if (prone_rec_state == 1)
     {
         prone_t += 0.001f;   /* ChassisTask 1kHz */
@@ -671,11 +836,62 @@ void ChassisTask()
         ten_targets.r_leg_length_target = rec_l_rise;
     }
 
+    /* ===== T3: 运行中翻倒监控（2026-11-05, SPR chassis_task.c:362 同款判据换腿摆角版）=====
+     * 站立/行驶/恢复摆角期（态1/2/3）双腿任一 |θ_body| 出窗驻留 -> 脱力进态4。
+     * θ_body 是纯编码器量, 不受欧拉角 ±90° 折返影响; 但腿悬空不动时不出窗
+     * （云台配重下侧倒难出现, 先接受）。prot_enable=0 时整块旁路（行为同旧版）。
+     * 触发时清 rise_anchor: 翻倒恢复链会再进态2, 必须重新锚定腿长起点防阶跃弹车。 */
+    if (prot_enable &&
+        (prone_rec_state == 1 || prone_rec_state == 2 || prone_rec_state == 3) &&
+        ten_balance_observe.l_leg_length > 0.05f &&
+        ten_balance_observe.r_leg_length > 0.05f)
+    {
+        if (fabsf(l_theta_body) > prot_theta_th || fabsf(r_theta_body) > prot_theta_th)
+        {
+            if (++prot_cnt >= prot_hold)
+            {
+                prone_rec_state = 4;
+                prot_armed = 0;
+                prot_seen_zf = 0;
+                prot_cnt = 0;
+                rise_anchor = 0;
+            }
+        }
+        else
+        {
+            prot_cnt = 0;
+        }
+    }
+    else
+    {
+        prot_cnt = 0;
+    }
+
     LQR_calc(&ten_balance_observe,&ten_targets,&four_control_datas);
     chassis_dbg.lqr_u[0] = four_control_datas.l_Tw;
     chassis_dbg.lqr_u[1] = four_control_datas.r_Tw;
     chassis_dbg.lqr_u[2] = four_control_datas.l_Tp;
     chassis_dbg.lqr_u[3] = four_control_datas.r_Tp;
+
+    /* ===== T4: 态4/5 输出覆盖（2026-11-05）=====
+     * 翻倒过渡期不经 LQR（手册第九章: 自救期强制不经 LQR/VMC 平衡通道）:
+     * Tp = θ_body PD（追赶式/归零目标）, Tw 硬清零, 腿长力仍走下方腿长环。
+     * LQR_calc 无内部状态, 覆盖安全。θ_body 目标: 态4=追赶式, 态5=0（归位）。 */
+    if ((prone_rec_state == 4 && prot_armed) || prone_rec_state == 5)
+    {
+        float l_tb = (prone_rec_state == 4) ? ten_targets.l_theta_target : 0.0f;
+        float r_tb = (prone_rec_state == 4) ? ten_targets.r_theta_target : 0.0f;
+        float lt4 = prot_kp_theta * (l_tb - l_theta_body)
+                    - prot_kd_theta * ten_balance_observe.l_dtheta;
+        float rt4 = prot_kp_theta * (r_tb - r_theta_body)
+                    - prot_kd_theta * ten_balance_observe.r_dtheta;
+        LIMIT_MIN_MAX(lt4, -prot_tp_max, prot_tp_max);
+        LIMIT_MIN_MAX(rt4, -prot_tp_max, prot_tp_max);
+        four_control_datas.l_Tp = lt4;
+        four_control_datas.r_Tp = rt4;
+        four_control_datas.l_Tw = 0.0f;
+        four_control_datas.r_Tw = 0.0f;
+    }
 
     /* ===== T2: GRF 悬空门控（2026-11-03 手册第九章降维）=====
      * 悬空时 LQR_SetAir 已把 K 矩阵轮相关值清零: Tw=0(止疯转),
@@ -717,11 +933,12 @@ void ChassisTask()
      * Roll 单位度 -> rad；Gyro[1] 为 roll 角速度(rad/s)。
      * FOLD 倒地阶段 roll 无意义,补偿关闭;DONE 恢复。 */
     float roll_rad = chassis_IMU_data->Roll * 0.01745329252f;
-    float dF_roll = (rec_state == 0) ? 0.0f
+    float dF_roll = (rec_state == 0 || prone_rec_state == 4 || prone_rec_state == 5) ? 0.0f
                                : ROLL_COMP_DIR * (roll_kp * (-roll_rad) - roll_kd * chassis_IMU_data->Gyro[1]);
     /* 重力前馈分阶段: FOLD 用小前馈(腿不承重,见 rec_gravity_ff 注释),
      * DONE 起立要顶起机体 + 正常控制用 50N。 */
-    float grav_ff = (rec_state == 0) ? rec_gravity_ff : LEG_GRAVITY_FF;
+    float grav_ff = (rec_state == 0 || prone_rec_state == 4 || prone_rec_state == 5)
+                    ? rec_gravity_ff : LEG_GRAVITY_FF;
     four_control_datas.l_Tleg = grav_ff + l_pid_out - dF_roll;
     four_control_datas.r_Tleg = grav_ff + r_pid_out + dF_roll;
     chassis_dbg.Fleg_cmd[0] = four_control_datas.l_Tleg;
@@ -730,12 +947,16 @@ void ChassisTask()
     chassis_dbg.Ldot[1] = r_dot;
     chassis_dbg.Roll = chassis_IMU_data->Roll;
     chassis_dbg.dFroll = dF_roll;
+    chassis_dbg.theta_body[0] = l_theta_body;
+    chassis_dbg.theta_body[1] = r_theta_body;
+    chassis_dbg.prot = (float)(prot_enable | (prot_armed << 1));
 
-    /* 观测无效期输出闸: 上电头几拍读数全 0, 腿长环却会以 30N/腿推腿,
+    /* 输出闸: ①观测无效期(上电头几拍读数全 0, 腿长环却会以 30N/腿推腿,
      * 折叠位形下该力把腿/轮推进入瞬态, 恢复锚定就锚到运动半途
-     * (2026-11-03 实测: dbg_th0_l=-0.56, 左轮 -408rad/s, s 冲 -0.69)。
-     * 判定完成(prone_rec_state 离开 0)前电机不出力, 腿由机械摩擦保持。 */
-    if (prone_rec_state == 0)
+     * (2026-11-03 实测: dbg_th0_l=-0.56, 左轮 -408rad/s, s 冲 -0.69),
+     * 判定完成(prone_rec_state 离开 0)前电机不出力, 腿由机械摩擦保持;
+     * ②态4 未武装期(翻倒检测触发后, 等操作手切档确认, 全零脱力无害等待)。 */
+    if (prone_rec_state == 0 || (prone_rec_state == 4 && !prot_armed))
     {
         four_control_datas.l_Tp = 0.0f;
         four_control_datas.r_Tp = 0.0f;
@@ -797,7 +1018,8 @@ void ChassisTask()
      * 左轮 l_wheel_direction=-1 的换算在 DMMotorSetRef 处，FF 加在换算前随之落位。
      * 仅 FOLD/EXTEND(轮未触地)阶段轮力矩恒 0;BALANCE 起轮控随 LQR 恢复。 */
     float r_Tw, l_Tw;
-    if (rec_state == 0 || !rec_wheels_on || air_state)
+    if (rec_state == 0 || !rec_wheels_on || air_state ||
+        prone_rec_state == 4 || prone_rec_state == 5)
     {
         /* FOLD 阶段, 或 DONE 后腿还没伸到轮使能门限(此时轮必然悬空),
          * 或 GRF 判悬空(T2): 轮力矩清零, 摩擦前馈一并跳过 */

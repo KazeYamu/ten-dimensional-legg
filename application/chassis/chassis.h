@@ -91,6 +91,9 @@ typedef struct
     float Roll;           /* IMU roll，度，调试 roll 补偿用 */
     float dFroll;         /* roll 补偿力差 ΔF（N），右腿为正 */
     float rec_state;      /* 倒地自起状态机: 0=FOLD 1=DONE */
+    /* ===== T3/T4 翻倒保护（2026-11-05, ep 观察）===== */
+    float theta_body[2];  /* [0]左 [1]右, 机体系摆角 = l_theta + Pitch·rad（纯编码器量） */
+    float prot;           /* bit0=监控使能 prot_enable, bit1=态4已武装 prot_armed */
 } Chassis_Dbg_s;
 extern volatile Chassis_Dbg_s chassis_dbg;
 
