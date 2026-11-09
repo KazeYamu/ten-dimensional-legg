@@ -42,6 +42,7 @@ extern volatile uint16_t grf_air_hold_off; /* 离地判定驻留 tick @1kHz */
 extern volatile uint16_t grf_air_hold_on;  /* 落地判定驻留 tick @1kHz */
 extern volatile uint16_t grf_air_delay;    /* 死延时 ms：上电后检测静默期,期间 air 恒 0 */
 uint8_t GRF_Airborne(void);                /* 1=悬空 0=触地（本拍状态机输出） */
+void GRF_RestartAirDelay(void);            /* 重启死延时+清悬空锁存(恢复流程 S4 进入沿调用) */
 
 void GRF_Init(void);
 /* @param r_Tf/r_Tb 右腿前后关节反馈力矩（电机坐标, N·m）

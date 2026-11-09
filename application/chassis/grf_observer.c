@@ -35,6 +35,20 @@ static uint32_t grf_tick = 0;   /* 上电起累计 tick @1kHz */
 
 uint8_t GRF_Airborne(void) { return grf_air; }
 
+/* 恢复流程 S4(LQR 交接)进入沿调用: 重启死延时并清悬空锁存。
+ * 两个动机(2026-11-09 审查):
+ * ① S1/S2 趴地位形 F_n 常 < th_off, 内部 grf_air 会锁存 1 —— chassis 侧
+ *    只在 S1~S4 屏蔽本地快照、不清锁存, 蹬地力若波动则带病进 S5;
+ * ② S4→S5 只是斜坡走完, 机体仍在拉起瞬态(重量转移期 N_avg 滞留 30~50
+ *    模糊带), 与上电垫高起立同类 —— 用同一死延时语义盖住整个交接+收零
+ *    +拉起(默认 3s, grf_air_delay 可调), 之后运行中悬空保护照常在线。 */
+void GRF_RestartAirDelay(void)
+{
+    grf_tick = 0;
+    grf_air = 0;
+    grf_air_cnt = 0;
+}
+
 static void grf_air_update(float n_l, float n_r)
 {
     float n_avg = 0.5f * (n_l + n_r);
