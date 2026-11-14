@@ -136,7 +136,7 @@ volatile float rec_l_low       = 0.13f;    /* 蹲姿交接/收腿下限 m(台架
 volatile float rec_retract_rate= 0.0005f; /* 态3 联动收腿目标斜率 m/tick = 50cm/s @1kHz(压深入下半圆起步的阶跃) */
 volatile float rec_lift_rate   = 0.0002f; /* 态5 起立腿长目标斜率 m/tick = 20cm/s @1kHz(旧STAND 实测值, "快而稳"调此) */
 volatile float rec_fold_l_th   = 0.13f;    /* 态6 触发: 平均腿长下限 m(断电折叠态 ≈0.11~0.124) */
-volatile float rec_fold_th     = 0.6f;    /* 态6 触发: 双腿 |θ_body| 上限 rad(与 S0 竖直带一致) */
+volatile float rec_fold_th     = 0.85f;   /* 态6 触发: 双腿 |θ_body| 上限 rad(11-14 零力实测折叠上电角 0.70/0.75, 留 0.1 裕量; 上界<π/2 保轮心在下半圆带内, 短转=轮沿地滚) */
 volatile float dbg_len_l = 0.25f, dbg_len_r = 0.25f; /* ep 读: 状态机当前腿长目标 */
 /* ---- 伸腿防弹(沿用 v2): 腿长误差超带期间 PID 分量钳 ±rec_push_max ---- */
 #define LEG_PID_OUT_MAX  (150.0f)          /* 腿长 PID 分量正常限幅 N */
